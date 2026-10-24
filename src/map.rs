@@ -169,6 +169,20 @@ impl<K, V> From<Map<K, V>> for BTreeMap<K, V> {
     }
 }
 
+/// Written as a sequence of `[key, value]` pairs, so that any key type works
+/// in JSON (where object keys must be strings).
+impl<K: Serialize, V: Serialize> Serialize for Map<K, V> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.collect_seq(&self.items)
+    }
+}
+
+impl<'de, K: Deserialize<'de> + Ord, V: Deserialize<'de>> Deserialize<'de> for Map<K, V> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Vec::<(K, V)>::deserialize(d).map(|pairs| pairs.into_iter().collect())
+    }
+}
+
 impl<K: Ord, V> FromIterator<(K, V)> for Map<K, V> {
     fn from_iter<I: IntoIterator<Item = (K, V)>>(iter: I) -> Self {
         Map::from(iter.into_iter().collect::<BTreeMap<_, _>>())
@@ -206,21 +220,32 @@ impl<K: Value + Ord, V: Value> Field for Map<K, V> {
     }
     fn changes(&mut self, origin: u64, emit: &mut dyn FnMut(MapOp<K, V>)) {
         if self.origin != origin {
+            // A different map: log the new contents in full.
+            self.settle();
             emit(MapOp::Clear);
-            self.initial(emit);
+            self.items.iter().for_each(|(k, v)| emit(MapOp::Insert(k.clone(), v.clone())));
         } else {
             self.flush();
             std::mem::take(&mut self.pending).into_iter().for_each(emit);
         }
     }
-    fn initial(&mut self, emit: &mut dyn FnMut(MapOp<K, V>)) {
+    fn settle(&mut self) {
         self.pending = Vec::new();
         self.touched = None;
         self.before = None;
-        self.items.iter().for_each(|(k, v)| emit(MapOp::Insert(k.clone(), v.clone())));
     }
     fn apply(&mut self, op: &MapOp<K, V>) -> Result<(), String> {
         op.apply_to(&mut self.items)
+    }
+    fn check(&self) -> Result<(), String> {
+        self.items.iter().try_for_each(|(k, v)| k.check().and_then(|()| v.check()))
+    }
+    fn check_op(op: &MapOp<K, V>) -> Result<(), String> {
+        match op {
+            MapOp::Insert(k, v) => k.check().and_then(|()| v.check()),
+            MapOp::Remove(k) => k.check(),
+            MapOp::Clear => Ok(()),
+        }
     }
     fn fmt_op(name: &str, op: &MapOp<K, V>, f: &mut fmt::Formatter) -> fmt::Result {
         match op {

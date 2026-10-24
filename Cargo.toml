@@ -6,6 +6,7 @@ rust-version = "1.74"
 description = "Plain Rust structs whose every change is recorded as an event, and a log that replays to the same state"
 license = "MIT OR Apache-2.0"
 readme = "README.md"
+repository = "https://github.com/d4per/replayable"
 keywords = ["event-sourcing", "change-tracking", "replay", "audit-log", "undo"]
 categories = ["data-structures", "database"]
 exclude = [".idea/", ".github/"]

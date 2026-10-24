@@ -18,3 +18,26 @@ First release.
 - JSON Lines persistence: `write_json`, `write_json_since` for appending,
   `read_json`, `to_json`, `from_json`, and `apply_event` for following
   another store's log.
+- Schema changes: fields with `= default`, renames with `(was old)`, and
+  removed fields and entity types declared with `#![removed(..)]`. Unknown
+  names in a log are an error.
+- `create` logs the whole value as one event, so later changes to a
+  default don't change history.
+- `Value::check` rejects NaN and infinite floats, debug builds check that
+  every logged change survives a trip through JSON, and `Store::verify`
+  compares a replay with the live state.
+- `Store::as_of(n)` rebuilds the state after the first `n` events, for
+  example to see something as it was before it was deleted.
+- `List` can be indexed with ranges (`list[a..b]`), like a `Vec`.
+- Every event is logged with its time, a `Timestamp` to the millisecond,
+  written first on each line as ISO 8601 UTC:
+  `{"at":"2026-10-24T09:15:02.123Z","CreateUser":[..]}`. The time is
+  required when reading a log. `Store::timestamps`, `Store::as_of_time`,
+  `Store::apply_event_at` and `Store::with_clock` (for tests). Times never
+  go backwards in a log.
+- A compact binary log format, usually a quarter of the size of the JSON:
+  `Store::write_binary`, `write_binary_since`, `read_binary`, `to_binary`
+  and `from_binary`. It's self-describing like the JSON, so model changes
+  work the same way, and appending doesn't repeat names already in the
+  file. Errors in it are `Error::Binary`. `Timestamp` is written as a
+  number in non-human-readable serde formats.

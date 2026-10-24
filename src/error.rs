@@ -13,6 +13,14 @@ pub enum Error {
         /// What serde_json reported.
         source: serde_json::Error,
     },
+    /// A binary log, as written by
+    /// [`Store::write_binary`](crate::Store::write_binary), couldn't be read.
+    Binary {
+        /// The byte offset of the event that couldn't be read.
+        offset: usize,
+        /// What was wrong.
+        reason: String,
+    },
     /// An event was well-formed but doesn't fit the state built up so far,
     /// for example an update to an entity that doesn't exist or a list index
     /// out of range. This means the log is corrupt or was changed by hand.
@@ -29,6 +37,7 @@ impl fmt::Display for Error {
         match self {
             Error::Io(e) => write!(f, "couldn't read the log: {e}"),
             Error::Json { line, source } => write!(f, "invalid event on line {line}: {source}"),
+            Error::Binary { offset, reason } => write!(f, "invalid binary log at byte {offset}: {reason}"),
             Error::InvalidEvent { index, reason } => write!(f, "event {index} can't be applied: {reason}"),
         }
     }
@@ -39,7 +48,7 @@ impl std::error::Error for Error {
         match self {
             Error::Io(e) => Some(e),
             Error::Json { source, .. } => Some(source),
-            Error::InvalidEvent { .. } => None,
+            Error::Binary { .. } | Error::InvalidEvent { .. } => None,
         }
     }
 }

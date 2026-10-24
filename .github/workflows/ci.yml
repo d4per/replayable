@@ -25,6 +25,9 @@ jobs:
         env:
           RUSTDOCFLAGS: -D warnings
       - run: cargo run --example basic
+      - run: cargo run --release --example message_board -- --fresh
+      - run: cargo run --release --example message_board -- --fresh --binary
+      - run: cargo run --release --example message_board -- --binary
 
   msrv:
     runs-on: ubuntu-latest

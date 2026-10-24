@@ -58,12 +58,12 @@ fn main() {
     }
 
     println!("\nEvent log:");
-    for (i, e) in store.events().iter().enumerate() {
-        println!("{:>3}. {e}", i + 1);
+    for (i, (at, e)) in store.timestamps().iter().zip(store.events()).enumerate() {
+        println!("{:>3}. {at} {e}", i + 1);
     }
 
     // Save, load again and compare
-    let loaded = Store::<World>::from_json(&store.to_json()).unwrap();
+    let loaded = Store::<World>::from_json(&store.to_json().unwrap()).unwrap();
     assert_eq!(loaded[sune], store[sune]);
     assert_eq!(loaded[club], store[club]);
     println!("\nLoaded from JSON: identical ✔");

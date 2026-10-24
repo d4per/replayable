@@ -22,13 +22,64 @@ use std::fmt;
 /// `Default` isn't required by `Value` itself, but a type needs it to be used
 /// directly as a field in [`model!`](crate::model). Inside a [`List`] or as
 /// a [`Map`] key or value, it's not needed.
-pub trait Value: Clone + PartialEq + fmt::Debug + Serialize + DeserializeOwned {}
+///
+/// The `Serialize`/`Deserialize` impls must give back an equal value, or a
+/// replay won't match. In debug builds every logged change is checked for
+/// that, so `#[serde(skip)]` on a field or a lossy format is found when the
+/// value is changed rather than when the log is loaded.
+pub trait Value: Clone + PartialEq + fmt::Debug + Serialize + DeserializeOwned {
+    /// Checks that the value can be stored, before it's logged. A value that
+    /// fails makes the edit panic with the message.
+    ///
+    /// Accepts everything by default. `f32` and `f64` reject NaN and
+    /// infinity, which JSON can't represent (serde_json writes them as `null`,
+    /// which can't be read back). Override it in your own types if they hold
+    /// floats or have other invariants:
+    ///
+    /// ```
+    /// # use serde::{Deserialize, Serialize};
+    /// #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+    /// struct Point { x: f64, y: f64 }
+    ///
+    /// impl replayable::Value for Point {
+    ///     fn check(&self) -> Result<(), String> {
+    ///         self.x.check()?;
+    ///         self.y.check()
+    ///     }
+    /// }
+    /// # use replayable::Value;
+    /// assert!(Point { x: f64::NAN, y: 0.0 }.check().is_err());
+    /// ```
+    fn check(&self) -> Result<(), String> {
+        Ok(())
+    }
+}
 
 macro_rules! impl_value {
     ($($t:ty),*) => { $( impl Value for $t {} )* };
 }
-impl_value!(String, bool, char, u8, u16, u32, u64, u128, i8, i16, i32, i64, i128, f32, f64, usize, isize);
-impl<T: Value> Value for Option<T> {}
+impl_value!(String, bool, char, u8, u16, u32, u64, u128, i8, i16, i32, i64, i128, usize, isize);
+
+macro_rules! impl_value_float {
+    ($($t:ty),*) => { $(
+        impl Value for $t {
+            fn check(&self) -> Result<(), String> {
+                if self.is_finite() {
+                    Ok(())
+                } else {
+                    Err(format!("{self} can't be stored, since JSON has no way to write it"))
+                }
+            }
+        }
+    )* };
+}
+impl_value_float!(f32, f64);
+
+impl<T: Value> Value for Option<T> {
+    fn check(&self) -> Result<(), String> {
+        self.as_ref().map_or(Ok(()), T::check)
+    }
+}
 impl<E: Entity> Value for Id<E> {}
 
 /// Maps the type you write in [`model!`](crate::model) to the type that is
@@ -103,20 +154,25 @@ pub type OpOf<T> = <Stored<T> as Field>::Op;
 /// the edit and [`changes`](Field::changes) after it. Types that track their
 /// own changes ([`List`] and [`Map`]) use a number as snapshot and are never
 /// copied.
-pub trait Field: Default + PartialEq + fmt::Debug {
+pub trait Field: Default + PartialEq + fmt::Debug + Serialize + DeserializeOwned {
     /// One logged change to the field.
-    type Op: Clone + fmt::Debug + Serialize + DeserializeOwned;
+    type Op: Clone + PartialEq + fmt::Debug + Serialize + DeserializeOwned;
     /// What's needed to see what changed.
     type Snapshot;
     /// Taken before an edit.
     fn snapshot(&self) -> Self::Snapshot;
     /// Emits the changes made since `before` was taken.
     fn changes(&mut self, before: Self::Snapshot, emit: &mut dyn FnMut(Self::Op));
-    /// Emits the changes that build the value up from `Default` (used by `create`).
-    fn initial(&mut self, emit: &mut dyn FnMut(Self::Op));
+    /// Forgets changes not yet emitted. Used by `create`, which logs the
+    /// whole value instead.
+    fn settle(&mut self);
     /// Applies a logged change during replay. Fails if it doesn't fit the
     /// current value, for example a list index out of range.
     fn apply(&mut self, op: &Self::Op) -> Result<(), String>;
+    /// Checks every value in the field with [`Value::check`].
+    fn check(&self) -> Result<(), String>;
+    /// Checks every value in a change with [`Value::check`].
+    fn check_op(op: &Self::Op) -> Result<(), String>;
     /// Writes a change in a human-readable form, used by `Display` on events.
     fn fmt_op(name: &str, op: &Self::Op, f: &mut fmt::Formatter) -> fmt::Result;
 }
@@ -133,12 +189,16 @@ impl<T: Value + Default> Field for T {
             emit(self.clone());
         }
     }
-    fn initial(&mut self, emit: &mut dyn FnMut(T)) {
-        self.changes(T::default(), emit);
-    }
+    fn settle(&mut self) {}
     fn apply(&mut self, op: &T) -> Result<(), String> {
         *self = op.clone();
         Ok(())
+    }
+    fn check(&self) -> Result<(), String> {
+        Value::check(self)
+    }
+    fn check_op(op: &T) -> Result<(), String> {
+        Value::check(op)
     }
     fn fmt_op(name: &str, op: &T, f: &mut fmt::Formatter) -> fmt::Result {
         write!(f, "set {name}={op:?}")

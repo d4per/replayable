@@ -124,11 +124,19 @@ fn main() {
     );
 
     let log = big_log();
-    let json = log.to_json();
-    println!("(big log: {} events, {} KiB of JSON)", log.events().len(), json.len() / 1024);
+    let json = log.to_json().unwrap();
+    let binary = log.to_binary().unwrap();
+    println!(
+        "(big log: {} events, {} KiB of JSON, {} KiB binary)",
+        log.events().len(),
+        json.len() / 1024,
+        binary.len() / 1024
+    );
     bench("replay big log", || log.events().to_vec(), |events| Store::<Bench>::replay(events).unwrap());
-    bench("to_json big log", || (), |_| log.to_json());
+    bench("to_json big log", || (), |_| log.to_json().unwrap());
     bench("from_json big log", || (), |_| Store::<Bench>::from_json(&json).unwrap());
+    bench("to_binary big log", || (), |_| log.to_binary().unwrap());
+    bench("from_binary big log", || (), |_| Store::<Bench>::from_binary(&binary).unwrap());
 
     // How many events each list operation logs.
     let count = |f: &dyn Fn(&mut List<u32>)| {

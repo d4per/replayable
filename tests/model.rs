@@ -1,9 +1,10 @@
 //! Tests through the public API, from outside the crate, so they also check
 //! that `model!` works when used from another crate.
 
-use replayable::{model, Error, Id, List, ListOp, Map, Store, Value};
+use replayable::{model, Error, Id, List, ListOp, Map, Store, Timestamp, Value};
 use serde::{Deserialize, Serialize};
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
 enum Status {
@@ -55,6 +56,13 @@ mod private {
         let replayed = replayable::Store::<Notes>::replay(store.events().to_vec()).unwrap();
         assert_eq!(replayed[b], store[b]);
     }
+}
+
+/// A clock that starts at 2026-10-24T09:15:02.123Z and moves `step`
+/// milliseconds each time it's read.
+fn ticking(step: u64) -> impl Fn() -> Timestamp + Send + Sync {
+    let next = AtomicU64::new(1_792_833_302_123);
+    move || Timestamp::from_unix_millis(next.fetch_add(step, Ordering::Relaxed))
 }
 
 fn replayed(store: &Store<World>) -> Store<World> {
@@ -205,8 +213,9 @@ fn replay_matches_live_state() {
         }
     }
 
-    let from_json = Store::<World>::from_json(&store.to_json()).unwrap();
-    for s in [&replayed(&store), &from_json] {
+    let from_json = Store::<World>::from_json(&store.to_json().unwrap()).unwrap();
+    let from_binary = Store::<World>::from_binary(&store.to_binary().unwrap()).unwrap();
+    for s in [&replayed(&store), &from_json, &from_binary] {
         for &u in &users {
             assert_eq!(s[u], store[u]);
         }
@@ -278,13 +287,24 @@ fn tracked_edits_give_minimal_events() {
 }
 
 #[test]
-fn create_logs_lists_as_one_event() {
+fn create_logs_the_whole_value_as_one_event() {
     let mut store = Store::<World>::new();
     let u =
         store.create(User { name: "a".into(), tags: List::from(vec!["x".into(), "y".into()]), ..Default::default() });
     let events: Vec<String> = store.events().iter().map(|e| e.to_string()).collect();
-    assert_eq!(events, ["create User id:1", r#"User id:1 set name="a""#, r#"User id:1 tags.splice(0..0, ["x", "y"])"#]);
+    assert_eq!(
+        events,
+        [r#"create User id:1 { name: "a", age: 0, parent: None, tags: ["x", "y"], status: Active, nick: None }"#]
+    );
     assert_eq!(replayed(&store)[u], store[u]);
+
+    // Changes made to a list before `create` aren't logged a second time.
+    let mut tags = List::new();
+    tags.push("p".to_string());
+    let v = store.create(User { tags, ..Default::default() });
+    store.edit(v).tags.push("q".into());
+    assert_eq!(replayed(&store)[v], store[v]);
+    assert_eq!(store[v].tags.as_slice(), ["p", "q"]);
 }
 
 #[test]
@@ -358,9 +378,99 @@ fn incremental_json_matches_full_json() {
         saved = store.events().len();
     }
 
-    assert_eq!(String::from_utf8(file.clone()).unwrap(), store.to_json());
+    assert_eq!(String::from_utf8(file.clone()).unwrap(), store.to_json().unwrap());
     let loaded = Store::<World>::read_json(file.as_slice()).unwrap();
     assert_eq!(loaded[u], store[u]);
+}
+
+#[test]
+fn deleted_entities_can_be_seen_in_earlier_states() {
+    let mut store = Store::<World>::new();
+    let u = store.create(User { name: "a".into(), ..Default::default() });
+    let g = store.create(Group { members: List::from(vec![u]), ..Default::default() });
+    let before_delete = store.events().len();
+    store.edit(g).members.clear();
+    store.delete(u);
+    assert!(!store.contains(u));
+
+    // The log still holds both the create and the delete.
+    let log: Vec<String> = store.events().iter().map(|e| e.to_string()).collect();
+    assert!(log[0].starts_with("create User id:1"));
+    assert_eq!(log.last().unwrap(), "delete User id:1");
+
+    let then = store.as_of(before_delete);
+    assert_eq!(then[u].name, "a");
+    assert_eq!(then[g].members.as_slice(), [u]);
+    assert!(!store.as_of(0).contains(u));
+    assert_eq!(store.as_of(store.events().len()).count::<User>(), 0);
+}
+
+#[test]
+fn events_are_logged_with_their_time() {
+    let mut store = Store::<World>::new().with_clock(ticking(1000));
+    let u = store.create(User::default());
+    store.edit(u).age = 1;
+    store.edit(u).tags.push("a".into());
+    let times: Vec<String> = store.timestamps().iter().map(|t| t.to_string()).collect();
+    assert_eq!(times, ["2026-10-24T09:15:02.123Z", "2026-10-24T09:15:03.123Z", "2026-10-24T09:15:04.123Z"]);
+
+    // The times are kept by a trip through JSON and by `as_of`.
+    let loaded = Store::<World>::from_json(&store.to_json().unwrap()).unwrap();
+    assert_eq!(loaded.timestamps(), store.timestamps());
+    assert_eq!(store.as_of(2).timestamps(), &store.timestamps()[..2]);
+
+    // `as_of_time` includes events at exactly that time.
+    let t = store.timestamps()[1];
+    assert_eq!(store.as_of_time(t)[u].age, 1);
+    assert!(store.as_of_time(t)[u].tags.is_empty());
+    assert_eq!(store.as_of_time(Timestamp::UNIX_EPOCH).count::<User>(), 0);
+    assert_eq!(store.as_of_time("9999-01-01T00:00:00.000Z".parse().unwrap())[u], store[u]);
+}
+
+#[test]
+fn times_never_go_backwards() {
+    // A clock that is set back an hour after the first event.
+    let reads = AtomicU64::new(0);
+    let clock = move || {
+        let back = if reads.fetch_add(1, Ordering::Relaxed) == 0 { 0 } else { 3_600_000 };
+        Timestamp::from_unix_millis(1_792_833_302_123 - back)
+    };
+    let mut store = Store::<World>::new().with_clock(clock);
+    let u = store.create(User::default());
+    store.edit(u).age = 1;
+    assert_eq!(store.timestamps()[0], store.timestamps()[1]);
+
+    // An event from the past can't be added to the log...
+    let before = store.events().len();
+    let event = WorldEvent::UpdateUser(u, UserChange::Age(2));
+    let err = store.apply_event_at(Timestamp::UNIX_EPOCH, event).unwrap_err();
+    assert!(matches!(err, Error::InvalidEvent { index: 2, .. }), "{err}");
+    assert!(err.to_string().contains("is before 2026-10-24T09:15:02.123Z"), "{err}");
+    assert_eq!((store.events().len(), store[u].age), (before, 1));
+
+    // ...and a log whose times go backwards can't be read.
+    let json = store.to_json().unwrap();
+    let bad = json.replacen("2026-10-24T09:15:02.123Z", "2026-10-24T09:15:02.124Z", 1);
+    assert!(matches!(Store::<World>::from_json(&bad), Err(Error::InvalidEvent { index: 1, .. })));
+}
+
+#[test]
+fn lines_without_a_valid_time_are_errors() {
+    let event = r#""CreateUser":[1,{"name":"x"}]"#;
+    for (line, message) in [
+        (format!("{{{event}}}"), "missing field `at`"),
+        (format!(r#"{{"at":"2026-10-24 09:15:02",{event}}}"#), "isn't a time like 2026-10-24T09:15:02.123Z"),
+        (format!(r#"{{"at":"2026-10-24T09:15:02.123Z","at":"2026-10-24T09:15:02.123Z",{event}}}"#), "duplicate"),
+        (r#"{"at":"2026-10-24T09:15:02.123Z"}"#.to_string(), "invalid length"),
+        (format!(r#"{{"at":"2026-10-24T09:15:02.123Z",{event},"DeleteUser":1}}"#), "a second event"),
+    ] {
+        let err = Store::<World>::from_json(&line).unwrap_err();
+        assert!(matches!(err, Error::Json { line: 1, .. }), "{err}");
+        assert!(err.to_string().contains(message), "{line}: {err}");
+    }
+    // The time may come after the event too.
+    let line = format!(r#"{{{event},"at":"2026-10-24T09:15:02.123Z"}}"#);
+    assert_eq!(Store::<World>::from_json(&line).unwrap().timestamps()[0].unix_millis(), 1_792_833_302_123);
 }
 
 #[test]
@@ -371,10 +481,12 @@ fn a_store_can_follow_another() {
     for i in 0..3 {
         leader.edit(u).age = i;
         leader.edit(u).tags.push(i.to_string());
-        for e in leader.events_since(follower.events().len()) {
-            follower.apply_event(e.clone()).unwrap();
+        let n = follower.events().len();
+        for (&at, e) in leader.timestamps()[n..].iter().zip(leader.events_since(n)) {
+            follower.apply_event_at(at, e.clone()).unwrap();
         }
         assert_eq!(follower[u], leader[u]);
+        assert_eq!(follower.timestamps(), leader.timestamps());
     }
 }
 
@@ -383,7 +495,7 @@ fn corrupt_logs_give_errors() {
     let mut store = Store::<World>::new();
     let u = store.create(User { tags: List::from(vec!["a".to_string()]), ..Default::default() });
     store.edit(u).tags.push("b".into());
-    let json = store.to_json();
+    let json = store.to_json().unwrap();
     let lines: Vec<&str> = json.lines().collect();
 
     // Not JSON at all, on line 2.
@@ -407,13 +519,13 @@ fn corrupt_logs_give_errors() {
     let err = Store::<World>::from_json(&bad).unwrap_err();
     assert_eq!(
         err.to_string(),
-        "event 2 can't be applied: User id:1 tags: index 5 is out of range for a list of length 1"
+        "event 1 can't be applied: User id:1 tags: index 5 is out of range for a list of length 1"
     );
 
     // Removing a key that isn't there.
     let g = Id::<Group>::from_raw(1);
     let events = [
-        WorldEvent::CreateGroup(g),
+        WorldEvent::CreateGroup(g, Box::default()),
         WorldEvent::UpdateGroup(g, GroupChange::Roles(replayable::MapOp::Remove(Id::from_raw(1)))),
     ];
     assert!(Store::<World>::replay(events).is_err());
@@ -428,24 +540,120 @@ fn corrupt_logs_give_errors() {
 
 #[test]
 fn json_format_is_stable() {
-    let mut store = Store::<World>::new();
+    let mut store = Store::<World>::new().with_clock(ticking(1));
     let u = store.create(User { name: "a".into(), ..Default::default() });
+    let g = store.create(Group { roles: Map::from_iter([(u, "x".to_string())]), ..Default::default() });
     store.edit(u).tags.extend(["x".to_string(), "y".to_string()]);
     store.edit(u).tags.remove(0);
     store.edit(u).status = Status::Away("lunch".into());
+    store.edit(g).members.push(u);
+    store.delete(g);
     assert_eq!(
-        store.to_json(),
+        store.to_json().unwrap(),
         concat!(
-            r#"{"CreateUser":1}"#,
+            r#"{"at":"2026-10-24T09:15:02.123Z","CreateUser":[1,{"name":"a","age":0,"parent":null,"tags":[],"status":"Active","nick":null}]}"#,
             "\n",
-            r#"{"UpdateUser":[1,{"Name":"a"}]}"#,
+            r#"{"at":"2026-10-24T09:15:02.124Z","CreateGroup":[2,{"title":"","members":[],"roles":[[1,"x"]]}]}"#,
             "\n",
-            r#"{"UpdateUser":[1,{"Tags":{"Splice":{"at":0,"remove":0,"insert":["x","y"]}}}]}"#,
+            r#"{"at":"2026-10-24T09:15:02.125Z","UpdateUser":[1,{"tags":{"Splice":{"at":0,"remove":0,"insert":["x","y"]}}}]}"#,
             "\n",
-            r#"{"UpdateUser":[1,{"Tags":{"Remove":0}}]}"#,
+            r#"{"at":"2026-10-24T09:15:02.126Z","UpdateUser":[1,{"tags":{"Remove":0}}]}"#,
             "\n",
-            r#"{"UpdateUser":[1,{"Status":{"Away":"lunch"}}]}"#,
+            r#"{"at":"2026-10-24T09:15:02.127Z","UpdateUser":[1,{"status":{"Away":"lunch"}}]}"#,
+            "\n",
+            r#"{"at":"2026-10-24T09:15:02.128Z","UpdateGroup":[2,{"members":{"Insert":[0,1]}}]}"#,
+            "\n",
+            r#"{"at":"2026-10-24T09:15:02.129Z","DeleteGroup":2}"#,
             "\n",
         )
     );
+}
+
+#[test]
+#[should_panic(expected = "NaN can't be stored")]
+fn nan_in_a_field_is_rejected() {
+    replayable::model! { Floats { Point { x: f64, xs: List<f64> } } }
+    let mut store = Store::<Floats>::new();
+    let p = store.create(Point::default());
+    store.edit(p).x = f64::NAN;
+}
+
+#[test]
+#[should_panic(expected = "inf can't be stored")]
+fn infinity_in_a_list_is_rejected() {
+    replayable::model! { Floats { Point { x: f64, xs: List<f64> } } }
+    let mut store = Store::<Floats>::new();
+    let p = store.create(Point::default());
+    store.edit(p).xs.push(f64::INFINITY);
+}
+
+#[test]
+#[should_panic(expected = "can't log")]
+fn nan_at_create_is_rejected() {
+    replayable::model! { Floats { Point { x: f64 } } }
+    let mut store = Store::<Floats>::new();
+    store.create(Point { x: f64::NAN });
+}
+
+/// A value type whose serde loses data. Debug builds catch it as soon as it's
+/// logged; `verify` catches it in any build.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+struct Lossy {
+    kept: u32,
+    #[serde(skip)]
+    lost: u32,
+}
+impl Value for Lossy {}
+
+#[test]
+#[cfg_attr(debug_assertions, should_panic(expected = "changes on a trip through JSON"))]
+fn lossy_value_types_are_caught() {
+    replayable::model! { Lossless { Thing { value: Lossy } } }
+    let mut store = Store::<Lossless>::new();
+    let t = store.create(Thing::default());
+    store.edit(t).value.lost = 1;
+    assert!(store.verify().is_err());
+}
+
+/// State changed without going through an edit is found by `verify`.
+#[derive(Debug, Default, Clone, PartialEq, Serialize, Deserialize)]
+struct Counter(std::cell::Cell<u32>);
+impl Value for Counter {}
+
+#[test]
+fn verify_finds_changes_that_were_not_logged() {
+    replayable::model! { Counters { Thing { count: Counter } } }
+    let mut store = Store::<Counters>::new();
+    let t = store.create(Thing::default());
+    store.edit(t).count = Counter(std::cell::Cell::new(1));
+    assert_eq!(store.verify(), Ok(()));
+
+    store[t].count.0.set(2); // through a shared reference, so not logged
+    let err = store.verify().unwrap_err();
+    assert!(err.contains("Thing id:1 differs after a replay"), "{err}");
+}
+
+#[test]
+fn verify_passes_after_many_random_changes() {
+    let mut store = Store::<World>::new();
+    let users: Vec<Id<User>> = (0..3).map(|_| store.create(User::default())).collect();
+    let g = store.create(Group::default());
+    for (i, &u) in users.iter().enumerate() {
+        store.edit(u).tags.extend((0..i).map(|j| j.to_string()));
+        store.edit(g).members.push(u);
+        store.edit(g).roles.insert(u, i.to_string());
+    }
+    store.delete(users[0]);
+    assert_eq!(store.verify(), Ok(()));
+}
+
+#[test]
+fn entities_without_fields_work() {
+    replayable::model! { Empty { Marker {} } }
+    let mut store = Store::<Empty>::new();
+    let m = store.create(Marker {});
+    let _ = store.edit(m);
+    assert_eq!(store.events().len(), 1);
+    assert_eq!(store.events()[0].to_string(), "create Marker id:1 { }");
+    assert_eq!(store.verify(), Ok(()));
 }

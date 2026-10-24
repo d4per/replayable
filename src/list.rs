@@ -3,6 +3,7 @@ use crate::field::{Field, Value};
 use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::ops::{Deref, DerefMut, Index, IndexMut};
+use std::slice::SliceIndex;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// A logged change to a [`List`].
@@ -301,9 +302,10 @@ impl<T: Clone + PartialEq> Extend<T> for List<T> {
     }
 }
 
-impl<T> Index<usize> for List<T> {
-    type Output = T;
-    fn index(&self, index: usize) -> &T {
+/// `list[i]`, `list[a..b]` and the other slice indexes, like a `Vec`.
+impl<T, I: SliceIndex<[T]>> Index<I> for List<T> {
+    type Output = I::Output;
+    fn index(&self, index: I) -> &I::Output {
         &self.items[index]
     }
 }
@@ -354,6 +356,19 @@ impl<T> From<List<T>> for Vec<T> {
     }
 }
 
+/// Written as a plain sequence, like a `Vec`.
+impl<T: Serialize> Serialize for List<T> {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        self.items.serialize(s)
+    }
+}
+
+impl<'de, T: Deserialize<'de>> Deserialize<'de> for List<T> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        Vec::deserialize(d).map(List::from)
+    }
+}
+
 impl<T> FromIterator<T> for List<T> {
     fn from_iter<I: IntoIterator<Item = T>>(iter: I) -> Self {
         List::from(iter.into_iter().collect::<Vec<_>>())
@@ -393,23 +408,34 @@ impl<T: Value> Field for List<T> {
     }
     fn changes(&mut self, origin: u64, emit: &mut dyn FnMut(ListOp<T>)) {
         if self.origin != origin {
+            // A different list: log the new contents in full.
+            self.settle();
             emit(ListOp::Clear);
-            self.initial(emit);
+            if !self.items.is_empty() {
+                emit(ListOp::splice(0, 0, self.items.clone()));
+            }
         } else {
             self.flush();
             std::mem::take(&mut self.pending).into_iter().for_each(emit);
         }
     }
-    fn initial(&mut self, emit: &mut dyn FnMut(ListOp<T>)) {
+    fn settle(&mut self) {
         self.pending = Vec::new();
         self.touched = None;
         self.before = None;
-        if !self.items.is_empty() {
-            emit(ListOp::splice(0, 0, self.items.clone()));
-        }
     }
     fn apply(&mut self, op: &ListOp<T>) -> Result<(), String> {
         op.apply_to(&mut self.items)
+    }
+    fn check(&self) -> Result<(), String> {
+        self.items.iter().try_for_each(T::check)
+    }
+    fn check_op(op: &ListOp<T>) -> Result<(), String> {
+        match op {
+            ListOp::Insert(_, v) | ListOp::Set(_, v) => v.check(),
+            ListOp::Splice(s) => s.insert.iter().try_for_each(T::check),
+            ListOp::Remove(_) | ListOp::Clear => Ok(()),
+        }
     }
     fn fmt_op(name: &str, op: &ListOp<T>, f: &mut fmt::Formatter) -> fmt::Result {
         fmt_list_op(name, op, f)
@@ -426,6 +452,16 @@ mod tests {
     {
         list.flush();
         std::mem::take(&mut list.pending)
+    }
+
+    #[test]
+    fn indexing_works_like_a_vec() {
+        let mut list = List::from(vec![1, 2, 3, 4]);
+        assert_eq!(list[1], 2);
+        assert_eq!(&list[1..3], [2, 3]);
+        assert_eq!(&list[2..], [3, 4]);
+        list[0] = 9;
+        assert_eq!(ops(&mut list), [ListOp::Set(0, 9)]);
     }
 
     #[test]
