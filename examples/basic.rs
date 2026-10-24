@@ -47,6 +47,14 @@ fn main() {
     });
     store.edit(club).roles.insert(bertil, "chair".into());
 
+    // Pin what should stay. `collect` deletes everything that nothing
+    // pinned refers to; Bertil stays as Sune's parent and the club's chair.
+    store.pin(sune);
+    store.pin(club);
+    let guest = store.create(User { name: "Guest".into(), ..Default::default() });
+    assert_eq!(store.collect(), 1);
+    assert!(!store.contains(guest));
+
     // Read: store[id] gives a plain &User
     let parent = store[sune].parent.unwrap();
     println!("{} ({} years) has parent {}", store[sune].name, store[sune].age, store[parent].name);

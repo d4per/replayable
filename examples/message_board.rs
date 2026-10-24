@@ -3,6 +3,10 @@
 //! Users create topics and post messages. A message can be deleted by its
 //! author, as long as no other user has posted in the topic after it.
 //!
+//! Users and topics are pinned. A message is kept because its topic lists
+//! it, so deleting one means taking it out of the topic and calling
+//! `collect`.
+//!
 //! 100 users act at the same time, each in its own thread. Every operation
 //! runs under one lock (the store has a single writer), and the events it
 //! produced are appended to a JSON Lines file before the lock is released.
@@ -82,7 +86,19 @@ impl Db {
         let store = if path.exists() { load(path, binary)? } else { Store::new() };
         let file = BufWriter::new(OpenOptions::new().create(true).append(true).open(path)?);
         let saved = store.events().len();
-        Ok(Db { store, file, binary, saved })
+        let mut db = Db { store, file, binary, saved };
+
+        // Files from before pins existed: pin the roots, or `collect` would
+        // delete them.
+        let users: Vec<Id<User>> = db.store.all::<User>().map(|(id, _)| id).collect();
+        let topics: Vec<Id<Topic>> = db.store.all::<Topic>().map(|(id, _)| id).collect();
+        let pinned = users.into_iter().filter(|&u| db.store.pin(u)).count()
+            + topics.into_iter().filter(|&t| db.store.pin(t)).count();
+        if pinned > 0 {
+            println!("pinned {pinned} users and topics from a log written before pins");
+            db.commit();
+        }
+        Ok(db)
     }
 
     /// Appends the events not yet in the file. Called at the end of every
@@ -100,12 +116,14 @@ impl Db {
 
     fn create_user(&mut self, name: String) -> Id<User> {
         let id = self.store.create(User { name });
+        self.store.pin(id);
         self.commit();
         id
     }
 
     fn create_topic(&mut self, author: Id<User>, title: String) -> Id<Topic> {
         let id = self.store.create(Topic { title, author: Some(author), ..Default::default() });
+        self.store.pin(id);
         self.commit();
         id
     }
@@ -133,8 +151,9 @@ impl Db {
             return Err(Refused::OthersPostedAfter);
         }
 
+        // Nothing else refers to the message, so `collect` deletes it.
         self.store.edit(topic).messages.remove(pos);
-        self.store.delete(message);
+        assert_eq!(self.store.collect(), 1);
         self.commit();
         Ok(())
     }
@@ -377,7 +396,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 }
 
 /// Deleting a message adds events and removes none: the post stays in the
-/// log, followed by its removal from the topic and its deletion. So the
+/// log, followed by its removal from the topic and the delete logged by
+/// `collect`. So the
 /// board can be rebuilt as it was before any deletion.
 fn show_deleted_history(store: &Store<Board>) -> Result<(), replayable::Error> {
     // Walk the log once, checking that every deleted message was posted

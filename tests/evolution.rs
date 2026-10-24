@@ -124,8 +124,10 @@ fn v1_store() -> Store<v1::World> {
     store.edit(b).tags.push("t".into());
     let h = store.create(Human { title: "dr".into() });
     store.edit(h).title = "prof".into();
+    store.pin(h);
     let t = store.create(Team { title: "x".into() });
     store.edit(t).title = "y".into();
+    store.pin(t);
     store
 }
 
@@ -142,14 +144,15 @@ fn a_newer_model_reads_an_older_log() {
     assert_eq!(users[0].nickname.as_deref(), Some("ace"));
     assert_eq!(users[1].nickname.as_deref(), Some("bee"));
     assert_eq!(users[1].tags.as_slice(), ["t"]);
-    // A renamed entity type.
-    let (_, person) = store.all::<Person>().next().unwrap();
+    // A renamed entity type, pinned under its old name.
+    let (p, person) = store.all::<Person>().next().unwrap();
     assert_eq!(person.title, "prof");
+    assert!(store.is_pinned(p));
 
     // Events about `age` and `Team` are skipped and not kept in the log.
     let kinds: Vec<String> = store.events().iter().map(|e| e.to_string()).collect();
     assert!(kinds.iter().all(|e| !e.contains("age") && !e.contains("Team")), "{kinds:#?}");
-    assert_eq!(store.events().len(), 6);
+    assert_eq!(store.events().len(), 7);
 }
 
 #[test]
@@ -221,7 +224,7 @@ fn an_undeclared_removed_field_is_an_error() {
 #[test]
 fn an_undeclared_removed_entity_is_an_error() {
     let err = Store::<undeclared_entity::World>::from_json(&v1_log()).unwrap_err();
-    assert!(matches!(err, Error::Json { line: 8, .. }), "{err}");
+    assert!(matches!(err, Error::Json { line: 9, .. }), "{err}");
     assert!(err.to_string().contains("unknown event `CreateTeam`"), "{err}");
 }
 

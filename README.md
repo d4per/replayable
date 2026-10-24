@@ -110,6 +110,9 @@ one variant per field, and a `<Model>Event` enum with
 - **Replacing** a whole list or map (`g.members = List::new()`, or
   `*user = User { .. }`) is noticed. Every collection carries a unique
   number, and the new contents are logged.
+- **Deleting** isn't done by hand. You pin the entities that should stay,
+  and `collect` deletes everything they can't reach, logging a delete for
+  each. So a reference held by an entity never dangles.
 - **Replay** applies events one by one to an empty model. It checks that
   every event fits, and returns an [`Error`] instead of panicking on a corrupt
   log.
@@ -130,9 +133,14 @@ Edits go through [`Store::edit`], which returns a guard that derefs to
 | `tags: List<String>`     | [`List<String>`][List]   |
 | `members: List<User>`    | `List<Id<User>>`         |
 | `roles: Map<User, Role>` | [`Map<Id<User>, Role>`][Map] |
+| `reply_to: Weak<Message>` | `Option<Id<Message>>` (a [weak reference](#deleting-pins-and-collect)) |
+| `seen_by: List<Weak<User>>` | `List<Id<User>>` |
 
 Entities can refer to themselves, so `parent: User` and `friends: List<User>`
-inside `User` both work. A reference to an entity is always optional,
+inside `User` both work, and so do cycles of any length, like a `Topic`
+with `messages: List<Message>` whose messages have `topic: Topic`. A
+reference is stored as an id, never as a copy, so nothing follows it by
+itself. A reference to an entity is always optional,
 because a new entity starts out from `Default`.
 
 Use `List` and `Map` instead of `Vec` and `BTreeMap`. They have the same API,
@@ -170,6 +178,69 @@ generated type and field. Leave it out to keep them private to the module.
 Doc comments and other attributes can be put on the model, on entities and
 on fields, and they end up on the generated items.
 
+## Deleting: pins and `collect`
+
+There's no `delete`. Instead, you [`pin`][`Store::pin`] the entities that
+should stay even when nothing refers to them, like users. Everything a
+pinned entity refers to stays as well, directly or through others.
+[`Store::collect`] deletes the rest:
+
+```rust
+use replayable::{model, List, Store, Weak};
+
+model! {
+    pub Board {
+        Topic { title: String, messages: List<Message> }
+        Message { text: String, topic: Topic, reply_to: Weak<Message> }
+    }
+}
+
+let mut store = Store::<Board>::new();
+let topic = store.create(Topic { title: "Hello".into(), ..Default::default() });
+store.pin(topic);
+
+let first = store.create(Message { text: "hi".into(), topic: Some(topic), ..Default::default() });
+let reply = store.create(Message { text: "hi!".into(), topic: Some(topic), reply_to: Some(first) });
+store.edit(topic).messages.extend([first, reply]);
+assert_eq!(store.collect(), 0);
+
+// To delete a message, take it out of the topic.
+store.edit(topic).messages.remove(0);
+assert_eq!(store.collect(), 1);
+assert!(!store.contains(first));
+assert_eq!(store[reply].reply_to, None);
+
+let log: Vec<String> = store.events().iter().map(|e| e.to_string()).collect();
+assert_eq!(log[log.len() - 3..], [
+    "Topic id:1 messages.remove(0)",
+    "Message id:3 set reply_to=None",
+    "delete Message id:2",
+]);
+```
+
+- **Cycles are deleted too.** The topic and its messages refer to each
+  other, but a cycle that nothing pinned can reach is deleted as a whole.
+  `collect` traces from the pins rather than counting references.
+- **Weak references** (`Weak<E>`, in a field, a `List`, or as a `Map` key or
+  value) don't keep anything. When `collect` deletes what one points to,
+  the field is set to `None`, or the element or entry is removed, and
+  that's logged before the delete.
+- **New entities are kept until `collect` runs.** Link them in, or pin
+  them, before you call it, for example at the end of each request.
+- **Ids kept outside the store can still go stale.** An `Id` in a local
+  variable, a `HashMap` or a URL isn't seen by `collect`. After a collect,
+  `store.get(id)` returns `None` and `store[id]` panics. Ids are never
+  reused, so a stale id never finds another entity.
+- **Ids inside your own value types** are only seen if the type overrides
+  [`Value::refs`]. Without that, the entity they point to can be deleted
+  while still in use.
+- **`collect` panics if nothing is pinned** but there are entities, since
+  it would delete them all. A log written before pins existed needs its
+  roots pinned first; see [Changing the model](#changing-the-model).
+- **Replay doesn't run `collect`.** The deletes it logged are replayed
+  like any other event. [`Store::unpin`] lets an entity go again, and
+  [`Store::is_pinned`] tells whether it's pinned.
+
 ## Saving and loading
 
 The log is written as [JSON Lines](https://jsonlines.org/), one event per
@@ -177,9 +248,11 @@ line, each with the time it was logged:
 
 ```text
 {"at":"2026-10-24T09:15:02.123Z","CreateUser":[1,{"name":"Sune","age":14,"parent":null,"tags":[]}]}
+{"at":"2026-10-24T09:15:02.123Z","PinUser":1}
 {"at":"2026-10-24T09:15:02.123Z","UpdateUser":[1,{"age":15}]}
 {"at":"2026-10-24T09:20:41.007Z","UpdateUser":[1,{"tags":{"Splice":{"at":0,"remove":0,"insert":["chess","football"]}}}]}
 {"at":"2026-10-25T18:03:59.640Z","UpdateUser":[1,{"tags":{"Remove":0}}]}
+{"at":"2026-11-02T07:45:12.311Z","UnpinUser":1}
 {"at":"2026-11-02T07:45:12.311Z","DeleteUser":1}
 ```
 
@@ -247,18 +320,20 @@ crate (or its [layout](#binary-layout)).
 
 ### Going back in time
 
-Nothing is ever removed from the log. An edit or a delete only adds events,
-so a deleted entity's creation and every change to it stay in the log,
-followed by its deletion. [`Store::as_of`] rebuilds the store as it was after
-the first `n` events, for example just before something was deleted:
+Nothing is ever removed from the log. An edit or a `collect` only adds
+events, so a deleted entity's creation and every change to it stay in the
+log, followed by its deletion. [`Store::as_of`] rebuilds the store as it was
+after the first `n` events, for example just before something was deleted:
 
 ```rust
 # use replayable::{model, Store};
 # model! { pub World { User { name: String } } }
 let mut store = Store::<World>::new();
+let me = store.create(User { name: "me".into() });
+store.pin(me);
 let u = store.create(User { name: "a".into() });
 let before = store.events().len();
-store.delete(u);
+store.collect();
 
 assert!(!store.contains(u));
 assert_eq!(store.as_of(before)[u].name, "a");
@@ -311,6 +386,7 @@ replayable::model! {
 | Change what a reference points to (`parent: User` → `parent: Group`) | **Not detected.** The old ids are read as ids of the new type. Add a new field instead. |
 | Re-add a name that was removed | Its old values come back, since they're still in the log. Pick a new name instead. |
 | Change your own value types | Use serde's attributes on them: `#[serde(default)]` for new fields, `#[serde(alias = "old")]` for renames. |
+| Make a reference weak, or strong again (`reply_to: Message` ↔ `Weak<Message>`) | Nothing: both are stored as ids. The next `collect` follows the new rule. |
 
 Using the same name twice (say, as a field and as removed) is a compile
 error. Skipped events aren't kept in [`Store::events`], so writing the whole
@@ -320,6 +396,20 @@ read with. Appending with `write_json_since` keeps the old lines as they are.
 
 A default (`= value`) is evaluated each time an old entity is replayed, so
 make it a constant, not something like the current time.
+
+A log written before pins existed has none, and `collect` refuses to run on
+it. Pin the roots once after loading it; `pin` returns `false` for those
+already pinned, so this can run at every start:
+
+```rust
+# use replayable::{model, Id, Store};
+# model! { pub World { User { name: String } } }
+# let mut store = Store::<World>::new();
+let users: Vec<Id<User>> = store.all::<User>().map(|(id, _)| id).collect();
+for u in users {
+    store.pin(u);
+}
+```
 
 ## What the compiler can't check
 
@@ -335,6 +425,7 @@ later:
 | A `PartialEq` that ignores some fields | Nothing. A change to only those fields isn't seen, so it isn't logged. |
 | `usize`/`isize` fields, read on a platform with a different width | Loading fails if a value doesn't fit. Prefer fixed-width integers. |
 | An `Ord` on a map key type that disagrees with its `PartialEq` | Nothing. Keep them consistent, as `BTreeMap` requires anyway. |
+| An `Id` inside your own value type, without overriding [`Value::refs`] | Nothing. `collect` doesn't see the id, and can delete what it points to while it's still in use. |
 
 ## What things cost
 
@@ -353,10 +444,13 @@ that changed.
 | `store.update(id, ..)` | like `edit`, plus taking the entity out of the table and putting it back, O(log entities) | like `edit` |
 | replacing a whole `List`/`Map` | – | `clear` + the full contents |
 | `store.create(value)` | a clone of the value | one `create` event holding every field |
+| `store.pin(id)`, `unpin` | O(log entities) | one `pin`/`unpin` event, if it changed |
+| `store.collect()` | O(entities + references), and an edit of each entity whose weak references are cleared | the weak changes, then one `delete` per entity |
 
 Rough numbers from `cargo bench` on a laptop: an `edit` that changes a
 scalar field takes about 80 ns, a `push` in an edit of its own about 45 ns,
-and replay about 60 ns per event (230 ns from JSON).
+replay about 60 ns per event (230 ns from JSON), and `collect` about
+150 ns per entity.
 
 ## Things to know
 
@@ -367,9 +461,9 @@ and replay about 60 ns per event (230 ns from JSON).
   `&mut` you were given.
 - **`update` can't create or edit other entities.** Its closure only gets
   `&Store`. Make those changes before or after.
-- **Deleting doesn't clean up references.** `Id`s that pointed to a deleted
-  entity are left dangling: `store[id]` panics and `store.get(id)` returns
-  `None`.
+- **Only `collect` deletes**, and only what no pinned entity can reach, so
+  the references entities hold never dangle. Ids you keep outside the
+  store can; see [Deleting](#deleting-pins-and-collect).
 - **Ids are unique across all entity types** in a store and are never
   reused. Use [`Id::from_raw`] to rebuild one from a number; it isn't
   checked.
@@ -463,6 +557,11 @@ conditions.
 [`Store::write_json`]: https://docs.rs/replayable/latest/replayable/struct.Store.html#method.write_json
 [`Error::Json`]: https://docs.rs/replayable/latest/replayable/enum.Error.html#variant.Json
 [`Value::check`]: https://docs.rs/replayable/latest/replayable/trait.Value.html#method.check
+[`Value::refs`]: https://docs.rs/replayable/latest/replayable/trait.Value.html#method.refs
+[`Store::pin`]: https://docs.rs/replayable/latest/replayable/struct.Store.html#method.pin
+[`Store::unpin`]: https://docs.rs/replayable/latest/replayable/struct.Store.html#method.unpin
+[`Store::is_pinned`]: https://docs.rs/replayable/latest/replayable/struct.Store.html#method.is_pinned
+[`Store::collect`]: https://docs.rs/replayable/latest/replayable/struct.Store.html#method.collect
 [`Store::verify`]: https://docs.rs/replayable/latest/replayable/struct.Store.html#method.verify
 [`Store::events`]: https://docs.rs/replayable/latest/replayable/struct.Store.html#method.events
 [`Store::as_of`]: https://docs.rs/replayable/latest/replayable/struct.Store.html#method.as_of

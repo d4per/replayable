@@ -1,6 +1,7 @@
 use crate::{Entity, Id, List, Map};
 use serde::{de::DeserializeOwned, Serialize};
 use std::fmt;
+use std::marker::PhantomData;
 
 /// A plain value that is stored as is and replaced as a whole when it changes.
 ///
@@ -53,6 +54,30 @@ pub trait Value: Clone + PartialEq + fmt::Debug + Serialize + DeserializeOwned {
     fn check(&self) -> Result<(), String> {
         Ok(())
     }
+
+    /// Visits the raw number of every [`Id`] in the value. The entities they
+    /// point to are kept alive by [`Store::collect`](crate::Store::collect).
+    ///
+    /// Visits nothing by default. `Id` visits itself, and `Option` its
+    /// content. Override it in your own types if they hold ids, or the
+    /// entities they point to can be collected while still in use:
+    ///
+    /// ```
+    /// # use serde::{Deserialize, Serialize};
+    /// # use replayable::{model, Id, Value};
+    /// # model! { World { User { name: String } } }
+    /// #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+    /// struct Vote { by: Id<User>, up: bool }
+    ///
+    /// impl Value for Vote {
+    ///     fn refs(&self, visit: &mut dyn FnMut(u64)) {
+    ///         self.by.refs(visit)
+    ///     }
+    /// }
+    /// ```
+    fn refs(&self, visit: &mut dyn FnMut(u64)) {
+        let _ = visit;
+    }
 }
 
 macro_rules! impl_value {
@@ -79,8 +104,31 @@ impl<T: Value> Value for Option<T> {
     fn check(&self) -> Result<(), String> {
         self.as_ref().map_or(Ok(()), T::check)
     }
+    fn refs(&self, visit: &mut dyn FnMut(u64)) {
+        if let Some(value) = self {
+            value.refs(visit)
+        }
+    }
 }
-impl<E: Entity> Value for Id<E> {}
+impl<E: Entity> Value for Id<E> {
+    fn refs(&self, visit: &mut dyn FnMut(u64)) {
+        visit(self.raw())
+    }
+}
+
+/// A weak reference to an entity, used as a field type in
+/// [`model!`](crate::model): `reply_to: Weak<Message>`, or
+/// `seen_by: List<Weak<User>>`.
+///
+/// It's stored like a plain reference, as `Option<Id<E>>` (or an `Id<E>` in
+/// a list or map), but it doesn't keep the entity alive. When
+/// [`Store::collect`](crate::Store::collect) deletes the entity, a weak
+/// field that points to it is set to `None`, and list elements and map
+/// entries that hold it are removed. Those changes are logged like any
+/// other.
+///
+/// Never constructed; it only names a field type.
+pub struct Weak<E: ?Sized>(PhantomData<E>);
 
 /// Maps the type you write in [`model!`](crate::model) to the type that is
 /// stored:
@@ -92,12 +140,29 @@ impl<E: Entity> Value for Id<E> {}
 /// | `tags: List<String>`     | `List<String>`           |
 /// | `members: List<User>`    | `List<Id<User>>`         |
 /// | `roles: Map<User, Role>` | `Map<Id<User>, Role>`    |
+/// | `reply_to: Weak<Message>`| `Option<Id<Message>>`    |
+/// | `seen_by: List<Weak<User>>` | `List<Id<User>>`      |
+///
+/// It also tells [`Store::collect`](crate::Store::collect) which entities a
+/// field keeps alive: every reference, except a [`Weak`] one.
 ///
 /// `Vec` and `BTreeMap` can't be used directly. Use [`List`] and [`Map`],
 /// which have the same API but make sure every change ends up in the log.
 pub trait Declared {
     /// The type of the field in the generated struct.
     type Stored: Field;
+    /// Visits the raw number of every entity the field keeps alive.
+    fn refs(stored: &Self::Stored, visit: &mut dyn FnMut(u64));
+    /// Whether the field holds a weak reference to an entity that isn't
+    /// alive.
+    fn has_dead(stored: &Self::Stored, alive: &dyn Fn(u64) -> bool) -> bool {
+        let _ = (stored, alive);
+        false
+    }
+    /// Removes the weak references to entities that aren't alive.
+    fn clear_dead(stored: &mut Self::Stored, alive: &dyn Fn(u64) -> bool) {
+        let _ = (stored, alive);
+    }
 }
 
 /// How a type is stored when it's an element of a [`List`] or a value in a
@@ -105,6 +170,14 @@ pub trait Declared {
 pub trait Element: Sized {
     /// The stored element type.
     type Elem: Value;
+    /// Visits the raw number of every entity the element keeps alive.
+    fn refs(elem: &Self::Elem, visit: &mut dyn FnMut(u64));
+    /// Whether the element is a weak reference to an entity that isn't
+    /// alive, so that it should be removed.
+    fn dead(elem: &Self::Elem, alive: &dyn Fn(u64) -> bool) -> bool {
+        let _ = (elem, alive);
+        false
+    }
 }
 
 /// How a type is stored when it's a key in a [`Map`]: like [`Element`], but
@@ -112,6 +185,14 @@ pub trait Element: Sized {
 pub trait Key: Sized {
     /// The stored key type.
     type Key: Value + Ord;
+    /// Visits the raw number of every entity the key keeps alive.
+    fn refs(key: &Self::Key, visit: &mut dyn FnMut(u64));
+    /// Whether the key is a weak reference to an entity that isn't alive,
+    /// so that its entry should be removed.
+    fn dead(key: &Self::Key, alive: &dyn Fn(u64) -> bool) -> bool {
+        let _ = (key, alive);
+        false
+    }
 }
 
 // The `?Sized` bounds on these impls stop the compiler from recursing forever
@@ -125,22 +206,84 @@ pub trait Key: Sized {
 #[allow(clippy::needless_maybe_sized)]
 impl<T: Value + Default + ?Sized> Declared for T {
     type Stored = T;
+    fn refs(stored: &T, visit: &mut dyn FnMut(u64)) {
+        stored.refs(visit)
+    }
 }
 #[allow(clippy::needless_maybe_sized)]
 impl<T: Value + ?Sized> Element for T {
     type Elem = T;
+    fn refs(elem: &T, visit: &mut dyn FnMut(u64)) {
+        elem.refs(visit)
+    }
 }
 #[allow(clippy::needless_maybe_sized)]
 impl<T: Value + Ord + ?Sized> Key for T {
     type Key = T;
+    fn refs(key: &T, visit: &mut dyn FnMut(u64)) {
+        key.refs(visit)
+    }
 }
 #[allow(clippy::needless_maybe_sized)]
 impl<T: Element + ?Sized> Declared for List<T> {
     type Stored = List<T::Elem>;
+    fn refs(list: &Self::Stored, visit: &mut dyn FnMut(u64)) {
+        list.iter().for_each(|e| T::refs(e, visit))
+    }
+    fn has_dead(list: &Self::Stored, alive: &dyn Fn(u64) -> bool) -> bool {
+        list.iter().any(|e| T::dead(e, alive))
+    }
+    fn clear_dead(list: &mut Self::Stored, alive: &dyn Fn(u64) -> bool) {
+        list.retain(|e| !T::dead(e, alive))
+    }
 }
 #[allow(clippy::needless_maybe_sized)]
 impl<K: Key + ?Sized, V: Element + ?Sized> Declared for Map<K, V> {
     type Stored = Map<K::Key, V::Elem>;
+    fn refs(map: &Self::Stored, visit: &mut dyn FnMut(u64)) {
+        for (k, v) in map.iter() {
+            K::refs(k, visit);
+            V::refs(v, visit);
+        }
+    }
+    fn has_dead(map: &Self::Stored, alive: &dyn Fn(u64) -> bool) -> bool {
+        map.iter().any(|(k, v)| K::dead(k, alive) || V::dead(v, alive))
+    }
+    fn clear_dead(map: &mut Self::Stored, alive: &dyn Fn(u64) -> bool) {
+        map.retain(|k, v| !K::dead(k, alive) && !V::dead(v, alive))
+    }
+}
+
+// A weak reference is stored like a plain one, but visits nothing, and is
+// the one thing that `clear_dead` removes.
+#[allow(clippy::needless_maybe_sized)]
+impl<E: Entity + ?Sized> Declared for Weak<E> {
+    type Stored = Option<Id<E>>;
+    fn refs(_: &Self::Stored, _: &mut dyn FnMut(u64)) {}
+    fn has_dead(stored: &Self::Stored, alive: &dyn Fn(u64) -> bool) -> bool {
+        stored.is_some_and(|id| !alive(id.raw()))
+    }
+    fn clear_dead(stored: &mut Self::Stored, alive: &dyn Fn(u64) -> bool) {
+        if Self::has_dead(stored, alive) {
+            *stored = None;
+        }
+    }
+}
+#[allow(clippy::needless_maybe_sized)]
+impl<E: Entity + ?Sized> Element for Weak<E> {
+    type Elem = Id<E>;
+    fn refs(_: &Id<E>, _: &mut dyn FnMut(u64)) {}
+    fn dead(id: &Id<E>, alive: &dyn Fn(u64) -> bool) -> bool {
+        !alive(id.raw())
+    }
+}
+#[allow(clippy::needless_maybe_sized)]
+impl<E: Entity + ?Sized> Key for Weak<E> {
+    type Key = Id<E>;
+    fn refs(_: &Id<E>, _: &mut dyn FnMut(u64)) {}
+    fn dead(id: &Id<E>, alive: &dyn Fn(u64) -> bool) -> bool {
+        !alive(id.raw())
+    }
 }
 
 /// The stored type for a declared field type. See [`Declared`].

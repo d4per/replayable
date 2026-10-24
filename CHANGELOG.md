@@ -9,8 +9,15 @@ First release.
 
 - `model!` declares entities and generates the structs, the change and
   event enums, and the model type.
-- `Store` with `create`, `edit`, `update`, `delete`, `try_edit`,
-  `try_update`, `get`, `contains`, `count`, `all` and `store[id]`.
+- `Store` with `create`, `edit`, `update`, `try_edit`, `try_update`,
+  `get`, `contains`, `count`, `all` and `store[id]`.
+- No explicit delete. `Store::pin` and `unpin` mark the entities to keep,
+  and `Store::collect` deletes every entity they can't reach, cycles
+  included, logging a `DeleteX` event for each. `Weak<E>` field types
+  (also in `List` and `Map`) don't keep anything, and are cleared, with
+  logged events, when what they point to is collected. `Value::refs` lets
+  your own value types report the ids they hold. Event format: new
+  `"PinX": id` and `"UnpinX": id` events.
 - `List` and `Map`, which track their own changes. Adjacent changes in one
   edit are merged into a single `ListOp::Splice`.
 - Replay that checks every event and reports corrupt logs as `Error`

@@ -70,7 +70,9 @@ fn sample() -> Store<World> {
     store.edit(a).friends.retain(|&f| f != b);
     let t = store.create(Topic { title: "hello".into(), ..Default::default() });
     store.edit(t).posts.extend(["one".to_string(), "two".to_string()]);
-    store.delete(t);
+    store.pin(a);
+    store.pin(b);
+    store.collect();
     store
 }
 

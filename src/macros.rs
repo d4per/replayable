@@ -38,7 +38,7 @@
 ///   mapping.
 /// - `enum UserChange { Name(String), Age(u8), Parent(Option<Id<User>>), Tags(ListOp<String>) }`:
 ///   one variant per field, in `CamelCase`.
-/// - `enum WorldEvent { CreateUser(Id<User>, Box<User>), UpdateUser(Id<User>, UserChange), DeleteUser(Id<User>), CreateGroup(..), .. }`,
+/// - `enum WorldEvent { CreateUser(Id<User>, Box<User>), UpdateUser(Id<User>, UserChange), DeleteUser(Id<User>), PinUser(Id<User>), UnpinUser(Id<User>), CreateGroup(..), .. }`,
 ///   which is what [`Store::events`](crate::Store::events) holds and what
 ///   is written as JSON.
 /// - `struct World`, the state, to use as `Store<World>`.
@@ -49,7 +49,8 @@
 /// entities and on fields.
 ///
 /// Field types must be [`Value`](crate::Value)s that implement `Default`,
-/// entity types from the same model, or `List`/`Map` of those.
+/// entity types from the same model, [`Weak`](crate::Weak) references to
+/// them, or `List`/`Map` of those.
 ///
 /// # Changing the model
 ///
@@ -138,12 +139,23 @@ macro_rules! model {
             // When the entity is used as a field type, a reference is stored.
             impl $crate::Declared for $entity {
                 type Stored = ::core::option::Option<$crate::Id<$entity>>;
+                fn refs(stored: &Self::Stored, visit: &mut dyn ::core::ops::FnMut(u64)) {
+                    if let ::core::option::Option::Some(id) = stored {
+                        visit(id.raw())
+                    }
+                }
             }
             impl $crate::Element for $entity {
                 type Elem = $crate::Id<$entity>;
+                fn refs(id: &Self::Elem, visit: &mut dyn ::core::ops::FnMut(u64)) {
+                    visit(id.raw())
+                }
             }
             impl $crate::Key for $entity {
                 type Key = $crate::Id<$entity>;
+                fn refs(id: &Self::Key, visit: &mut dyn ::core::ops::FnMut(u64)) {
+                    visit(id.raw())
+                }
             }
 
             #[doc = ::core::concat!("A logged change to one field of [`", ::core::stringify!($entity), "`].")]
@@ -244,6 +256,21 @@ macro_rules! model {
                     }
                 }
 
+                #[allow(unused_variables)]
+                fn refs(&self, visit: &mut dyn ::core::ops::FnMut(u64)) {
+                    $( <$ty as $crate::Declared>::refs(&self.$field, visit); )*
+                }
+
+                #[allow(unused_variables)]
+                fn has_dead_weak(&self, alive: &dyn ::core::ops::Fn(u64) -> bool) -> bool {
+                    false $( || <$ty as $crate::Declared>::has_dead(&self.$field, alive) )*
+                }
+
+                #[allow(unused_variables)]
+                fn clear_dead_weak(&mut self, alive: &dyn ::core::ops::Fn(u64) -> bool) {
+                    $( <$ty as $crate::Declared>::clear_dead(&mut self.$field, alive); )*
+                }
+
                 fn serialize_fields<S: $crate::__private::serde::Serializer>(&self, s: S) -> ::core::result::Result<S::Ok, S::Error> {
                     use $crate::__private::serde::ser::SerializeMap;
                     let mut map = s.serialize_map(::core::option::Option::None)?;
@@ -299,6 +326,10 @@ macro_rules! model {
                 [<Update $entity>]($crate::Id<$entity>, [<$entity Change>]),
                 #[doc = ::core::concat!("A [`", ::core::stringify!($entity), "`] was deleted.")]
                 [<Delete $entity>]($crate::Id<$entity>),
+                #[doc = ::core::concat!("A [`", ::core::stringify!($entity), "`] was pinned, so it's kept alive.")]
+                [<Pin $entity>]($crate::Id<$entity>),
+                #[doc = ::core::concat!("A [`", ::core::stringify!($entity), "`] was unpinned.")]
+                [<Unpin $entity>]($crate::Id<$entity>),
             )*
         }
 
@@ -318,6 +349,8 @@ macro_rules! model {
                         }
                         Self::[<Update $entity>](id, c) => ::core::write!(f, "{id:?} {c}"),
                         Self::[<Delete $entity>](id) => ::core::write!(f, "delete {id:?}"),
+                        Self::[<Pin $entity>](id) => ::core::write!(f, "pin {id:?}"),
+                        Self::[<Unpin $entity>](id) => ::core::write!(f, "unpin {id:?}"),
                     )*
                 }
             }
@@ -346,6 +379,7 @@ macro_rules! model {
         #[allow(non_snake_case)]
         $vis struct $model {
             $( $entity: $crate::__private::BTreeMap<$crate::Id<$entity>, $entity>, )*
+            __pinned: $crate::__private::BTreeSet<u64>,
         }
 
         impl $crate::Model for $model {
@@ -371,10 +405,56 @@ macro_rules! model {
                             if self.$entity.remove(id).is_none() {
                                 return ::core::result::Result::Err(::std::format!("{id:?} doesn't exist"));
                             }
+                            // Logs from before pins existed delete explicitly.
+                            self.__pinned.remove(&id.raw());
+                        }
+                        [<$model Event>]::[<Pin $entity>](id) => {
+                            if !self.$entity.contains_key(id) {
+                                return ::core::result::Result::Err(::std::format!("{id:?} doesn't exist"));
+                            }
+                            if !self.__pinned.insert(id.raw()) {
+                                return ::core::result::Result::Err(::std::format!("{id:?} is already pinned"));
+                            }
+                        }
+                        [<$model Event>]::[<Unpin $entity>](id) => {
+                            if !self.$entity.contains_key(id) || !self.__pinned.remove(&id.raw()) {
+                                return ::core::result::Result::Err(::std::format!("{id:?} isn't pinned"));
+                            }
                         }
                     )*
                 }
                 ::core::result::Result::Ok(())
+            }
+
+            fn pins(&self) -> &$crate::__private::BTreeSet<u64> {
+                &self.__pinned
+            }
+
+            fn pins_mut(&mut self) -> &mut $crate::__private::BTreeSet<u64> {
+                &mut self.__pinned
+            }
+
+            fn is_empty(&self) -> bool {
+                true $( && self.$entity.is_empty() )*
+            }
+
+            #[allow(unused_variables)]
+            fn refs_of(&self, raw: u64, visit: &mut dyn ::core::ops::FnMut(u64)) -> bool {
+                $(
+                    if let ::core::option::Option::Some(e) = self.$entity.get(&$crate::Id::from_raw(raw)) {
+                        $crate::Entity::refs(e, visit);
+                        return true;
+                    }
+                )*
+                false
+            }
+
+            #[allow(unused_variables)]
+            fn sweep(store: &mut $crate::Store<Self>, alive: &dyn ::core::ops::Fn(u64) -> bool) -> usize {
+                // Weak references to the dead first, so that every change is
+                // logged before the deletes.
+                $( $crate::__private::clear_dead_weak::<$model, $entity>(store, alive); )*
+                0 $( + $crate::__private::delete_dead::<$model, $entity>(store, alive) )*
             }
 
             fn entity_id(event: &Self::Event) -> u64 {
@@ -382,7 +462,9 @@ macro_rules! model {
                     $(
                         [<$model Event>]::[<Create $entity>](id, _)
                         | [<$model Event>]::[<Update $entity>](id, _)
-                        | [<$model Event>]::[<Delete $entity>](id) => id.raw(),
+                        | [<$model Event>]::[<Delete $entity>](id)
+                        | [<$model Event>]::[<Pin $entity>](id)
+                        | [<$model Event>]::[<Unpin $entity>](id) => id.raw(),
                     )*
                 }
             }
@@ -393,7 +475,9 @@ macro_rules! model {
                         [<$model Event>]::[<Create $entity>](_, entity) => $crate::Entity::check(&**entity),
                         [<$model Event>]::[<Update $entity>](_, change) =>
                             <$entity as $crate::Entity>::check_change(change),
-                        [<$model Event>]::[<Delete $entity>](_) => ::core::result::Result::Ok(()),
+                        [<$model Event>]::[<Delete $entity>](_)
+                        | [<$model Event>]::[<Pin $entity>](_)
+                        | [<$model Event>]::[<Unpin $entity>](_) => ::core::result::Result::Ok(()),
                     )*
                 }
             }
@@ -416,6 +500,11 @@ macro_rules! model {
                         }
                     }
                 )*
+                if self.__pinned != other.__pinned {
+                    return ::core::option::Option::Some(::std::format!(
+                        "the pinned ids differ after a replay:\n  live: {:?}\n  replayed: {:?}",
+                        self.__pinned, other.__pinned));
+                }
                 ::core::option::Option::None
             }
 
@@ -437,6 +526,14 @@ macro_rules! model {
                         ),
                         [<$model Event>]::[<Delete $entity>](id) => map.serialize_entry(
                             ::core::concat!("Delete", ::core::stringify!($entity)),
+                            id,
+                        ),
+                        [<$model Event>]::[<Pin $entity>](id) => map.serialize_entry(
+                            ::core::concat!("Pin", ::core::stringify!($entity)),
+                            id,
+                        ),
+                        [<$model Event>]::[<Unpin $entity>](id) => map.serialize_entry(
+                            ::core::concat!("Unpin", ::core::stringify!($entity)),
                             id,
                         ),
                     )*
@@ -469,6 +566,12 @@ macro_rules! model {
                         ::core::concat!("Delete", ::core::stringify!($entity))
                         $($( | ::core::concat!("Delete", ::core::stringify!($old_entity)) )+)? =>
                             ::core::result::Result::Ok(Parsed::Event([<$model Event>]::[<Delete $entity>](map.next_value()?))),
+                        ::core::concat!("Pin", ::core::stringify!($entity))
+                        $($( | ::core::concat!("Pin", ::core::stringify!($old_entity)) )+)? =>
+                            ::core::result::Result::Ok(Parsed::Event([<$model Event>]::[<Pin $entity>](map.next_value()?))),
+                        ::core::concat!("Unpin", ::core::stringify!($entity))
+                        $($( | ::core::concat!("Unpin", ::core::stringify!($old_entity)) )+)? =>
+                            ::core::result::Result::Ok(Parsed::Event([<$model Event>]::[<Unpin $entity>](map.next_value()?))),
                     )*
                     $($(
                         ::core::concat!("Create", ::core::stringify!($gone_entity))
@@ -476,7 +579,9 @@ macro_rules! model {
                             let (id, _): (u64, IgnoredAny) = map.next_value()?;
                             ::core::result::Result::Ok(Parsed::Skipped { id })
                         }
-                        ::core::concat!("Delete", ::core::stringify!($gone_entity)) =>
+                        ::core::concat!("Delete", ::core::stringify!($gone_entity))
+                        | ::core::concat!("Pin", ::core::stringify!($gone_entity))
+                        | ::core::concat!("Unpin", ::core::stringify!($gone_entity)) =>
                             ::core::result::Result::Ok(Parsed::Skipped { id: map.next_value()? }),
                     )*)?
                     other => ::core::result::Result::Err($crate::__private::unknown(
@@ -499,6 +604,12 @@ macro_rules! model {
                 }
                 fn deleted(id: $crate::Id<$entity>) -> Self::Event {
                     [<$model Event>]::[<Delete $entity>](id)
+                }
+                fn pinned(id: $crate::Id<$entity>) -> Self::Event {
+                    [<$model Event>]::[<Pin $entity>](id)
+                }
+                fn unpinned(id: $crate::Id<$entity>) -> Self::Event {
+                    [<$model Event>]::[<Unpin $entity>](id)
                 }
                 fn table(&self) -> &$crate::__private::BTreeMap<$crate::Id<$entity>, $entity> {
                     &self.$entity

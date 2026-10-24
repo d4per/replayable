@@ -352,8 +352,9 @@ fn fallible_access() {
     assert_eq!((store.count::<User>(), store.count::<Group>()), (1, 1));
     assert_eq!(store.try_edit(u).map(|e| e.id()), Some(u));
 
-    assert_eq!(store.delete(u).map(|u| u.name), Some("a".to_string()));
-    assert!(store.delete(u).is_none());
+    store.pin(g);
+    assert_eq!(store.collect(), 1);
+    assert_eq!(store.collect(), 0);
     assert!(!store.contains(u));
     assert_eq!(store.all::<User>().count(), 0);
     assert_eq!(store.all::<Group>().map(|(id, _)| id).collect::<Vec<_>>(), [g]);
@@ -388,9 +389,10 @@ fn deleted_entities_can_be_seen_in_earlier_states() {
     let mut store = Store::<World>::new();
     let u = store.create(User { name: "a".into(), ..Default::default() });
     let g = store.create(Group { members: List::from(vec![u]), ..Default::default() });
+    store.pin(g);
     let before_delete = store.events().len();
     store.edit(g).members.clear();
-    store.delete(u);
+    store.collect();
     assert!(!store.contains(u));
 
     // The log still holds both the create and the delete.
@@ -547,7 +549,10 @@ fn json_format_is_stable() {
     store.edit(u).tags.remove(0);
     store.edit(u).status = Status::Away("lunch".into());
     store.edit(g).members.push(u);
-    store.delete(g);
+    store.pin(u);
+    store.pin(g);
+    store.unpin(g);
+    store.collect();
     assert_eq!(
         store.to_json().unwrap(),
         concat!(
@@ -563,7 +568,13 @@ fn json_format_is_stable() {
             "\n",
             r#"{"at":"2026-10-24T09:15:02.128Z","UpdateGroup":[2,{"members":{"Insert":[0,1]}}]}"#,
             "\n",
-            r#"{"at":"2026-10-24T09:15:02.129Z","DeleteGroup":2}"#,
+            r#"{"at":"2026-10-24T09:15:02.129Z","PinUser":1}"#,
+            "\n",
+            r#"{"at":"2026-10-24T09:15:02.130Z","PinGroup":2}"#,
+            "\n",
+            r#"{"at":"2026-10-24T09:15:02.131Z","UnpinGroup":2}"#,
+            "\n",
+            r#"{"at":"2026-10-24T09:15:02.132Z","DeleteGroup":2}"#,
             "\n",
         )
     );
@@ -643,7 +654,10 @@ fn verify_passes_after_many_random_changes() {
         store.edit(g).members.push(u);
         store.edit(g).roles.insert(u, i.to_string());
     }
-    store.delete(users[0]);
+    store.pin(g);
+    store.edit(g).members.remove(0);
+    store.edit(g).roles.remove(&users[0]);
+    assert_eq!(store.collect(), 1);
     assert_eq!(store.verify(), Ok(()));
 }
 

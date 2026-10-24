@@ -17,6 +17,12 @@ model! {
     }
 }
 
+model! {
+    Graph {
+        Node { next: List<Node> }
+    }
+}
+
 const N: u32 = 10_000;
 const RUNS: usize = 15;
 const WARMUP: usize = 3;
@@ -47,6 +53,21 @@ fn user_with_tags(tags: impl IntoIterator<Item = u32>) -> (Store<Bench>, Id<User
     let mut store = Store::new();
     let id = store.create(User { tags: tags.into_iter().collect(), ..Default::default() });
     (store, id)
+}
+
+/// 10k nodes in a chain, each also linking back to the first. Only the
+/// first is pinned.
+fn chain() -> (Store<Graph>, Id<Node>) {
+    let mut store = Store::new();
+    let first = store.create(Node::default());
+    store.pin(first);
+    let mut last = first;
+    for _ in 1..N {
+        let node = store.create(Node { next: List::from(vec![first]) });
+        store.edit(last).next.push(node);
+        last = node;
+    }
+    (store, first)
 }
 
 /// A log of 10k users followed by edits of scalars and lists.
@@ -122,6 +143,17 @@ fn main() {
             store
         },
     );
+
+    bench("collect 10k, all kept", chain, |(mut store, _)| {
+        assert_eq!(store.collect(), 0);
+        store
+    });
+
+    bench("collect 10k, all deleted", chain, |(mut store, first)| {
+        store.edit(first).next.clear();
+        assert_eq!(store.collect(), N as usize - 1);
+        store
+    });
 
     let log = big_log();
     let json = log.to_json().unwrap();

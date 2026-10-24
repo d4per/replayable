@@ -4,7 +4,7 @@ use crate::{Error, Id, Timestamp};
 use serde::de::MapAccess;
 use serde::ser::{SerializeMap, Serializer};
 use serde::{de::DeserializeOwned, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::fmt;
 use std::io::{BufRead, Read, Write};
 use std::ops::{Deref, DerefMut, Index};
@@ -33,6 +33,13 @@ pub trait Entity: Default + Clone + PartialEq + fmt::Debug + 'static {
     fn check(&self) -> Result<(), String>;
     /// Checks every value in a change with [`Value::check`](crate::Value::check).
     fn check_change(change: &Self::Change) -> Result<(), String>;
+    /// Visits the raw number of every entity this one keeps alive: all its
+    /// references except [`Weak`](crate::Weak) ones.
+    fn refs(&self, visit: &mut dyn FnMut(u64));
+    /// Whether a weak reference points to an entity that isn't alive.
+    fn has_dead_weak(&self, alive: &dyn Fn(u64) -> bool) -> bool;
+    /// Removes the weak references to entities that aren't alive.
+    fn clear_dead_weak(&mut self, alive: &dyn Fn(u64) -> bool);
     /// Writes the entity as a map from field name to value.
     #[doc(hidden)]
     fn serialize_fields<S: Serializer>(&self, s: S) -> Result<S::Ok, S::Error>;
@@ -59,6 +66,20 @@ pub trait Model: Default {
     fn check_event(event: &Self::Event) -> Result<(), String>;
     /// Describes the first entity that differs between two states, if any.
     fn first_difference(&self, other: &Self) -> Option<String>;
+    /// The raw ids of the pinned entities.
+    fn pins(&self) -> &BTreeSet<u64>;
+    /// The raw ids of the pinned entities, mutably.
+    #[doc(hidden)]
+    fn pins_mut(&mut self) -> &mut BTreeSet<u64>;
+    /// Whether there are no entities at all.
+    fn is_empty(&self) -> bool;
+    /// Visits what the entity with the raw id `raw` keeps alive, see
+    /// [`Entity::refs`]. Returns `false` if there's no such entity.
+    fn refs_of(&self, raw: u64, visit: &mut dyn FnMut(u64)) -> bool;
+    /// Clears weak references to the entities that aren't alive, then
+    /// deletes those entities. Returns how many were deleted.
+    #[doc(hidden)]
+    fn sweep(store: &mut Store<Self>, alive: &dyn Fn(u64) -> bool) -> usize;
     /// Writes an event as one entry of a map, like `"CreateUser": [..]`.
     #[doc(hidden)]
     fn serialize_event<S: SerializeMap>(event: &Self::Event, map: &mut S) -> Result<(), S::Error>;
@@ -77,6 +98,10 @@ pub trait Contains<E: Entity>: Model {
     fn updated(id: Id<E>, change: E::Change) -> Self::Event;
     /// The event for deleting `id`.
     fn deleted(id: Id<E>) -> Self::Event;
+    /// The event for pinning `id`.
+    fn pinned(id: Id<E>) -> Self::Event;
+    /// The event for unpinning `id`.
+    fn unpinned(id: Id<E>) -> Self::Event;
     /// The table of `E`.
     fn table(&self) -> &BTreeMap<Id<E>, E>;
     /// The table of `E`, mutably.
@@ -125,12 +150,19 @@ impl<M: Model> Log<M> {
 /// The state changes in two ways, which always give the same result:
 /// - Live: entities are changed directly, and the changes are logged
 ///   ([`create`](Store::create), [`edit`](Store::edit),
-///   [`update`](Store::update), [`delete`](Store::delete)).
+///   [`update`](Store::update), [`pin`](Store::pin),
+///   [`collect`](Store::collect)).
 /// - Replay: events are applied one by one ([`replay`](Store::replay),
 ///   [`read_json`](Store::read_json), [`apply_event`](Store::apply_event)).
 ///
 /// Reading works like a map: `store[id]` gives a `&E` and panics if the id
 /// doesn't exist, [`get`](Store::get) gives an `Option<&E>`.
+///
+/// Entities aren't deleted by hand. [`pin`](Store::pin) the ones that should
+/// stay, and [`collect`](Store::collect) deletes every entity that no pinned
+/// one refers to, directly or through others. A reference held by an entity
+/// therefore never dangles. An id kept outside the store can still outlive
+/// its entity.
 ///
 /// Every event is logged with the time it happened, a [`Timestamp`] to the
 /// millisecond. See [`timestamps`](Store::timestamps) and
@@ -149,6 +181,7 @@ impl<M: Model> Log<M> {
 /// let mut store = Store::<Shop>::new();
 /// let pen = store.create(Item { name: "Pen".into(), price: 3 });
 /// let cart = store.create(Cart::default());
+/// store.pin(cart);
 ///
 /// store.edit(cart).items.push(pen);
 /// store.edit(pen).price = 4;
@@ -156,6 +189,11 @@ impl<M: Model> Log<M> {
 /// // `update` lets the closure read the rest of the store.
 /// store.update(cart, |c, store| c.total = c.items.iter().map(|&i| store[i].price).sum());
 /// assert_eq!(store[cart].total, 4);
+///
+/// // Once nothing refers to the pen, `collect` deletes it.
+/// store.edit(cart).items.clear();
+/// assert_eq!(store.collect(), 1);
+/// assert!(!store.contains(pen));
 ///
 /// let replayed = Store::<Shop>::replay(store.events().to_vec()).unwrap();
 /// assert_eq!(replayed[cart], store[cart]);
@@ -215,6 +253,9 @@ impl<M: Model> Store<M> {
     /// The whole value is logged, every field included. So if a field's
     /// default changes later, entities created before that keep the values
     /// they were created with.
+    ///
+    /// The new entity is kept until the next [`collect`](Store::collect).
+    /// By then it must be pinned, or referred to by something that's kept.
     pub fn create<E: Entity>(&mut self, mut value: E) -> Id<E>
     where
         M: Contains<E>,
@@ -283,17 +324,81 @@ impl<M: Model> Store<M> {
         Some(result.unwrap_or_else(|payload| panic::resume_unwind(payload)))
     }
 
-    /// Deletes an entity and returns it, or `None` if it didn't exist.
+    /// Pins an entity, so that [`collect`](Store::collect) keeps it and
+    /// everything it refers to. Returns `false` if it was already pinned.
     ///
-    /// Other entities that refer to it keep their `Id`s, which then point
-    /// at nothing: `store[id]` panics and `store.get(id)` returns `None`.
-    pub fn delete<E: Entity>(&mut self, id: Id<E>) -> Option<E>
+    /// Pin the roots of your data: the entities that should stay even when
+    /// nothing refers to them, like users. Panics if `id` doesn't exist.
+    pub fn pin<E: Entity>(&mut self, id: Id<E>) -> bool
     where
         M: Contains<E>,
     {
-        let entity = self.state.table_mut().remove(&id)?;
-        self.log.push_live(M::deleted(id));
-        Some(entity)
+        assert!(self.contains(id), "{id:?} doesn't exist");
+        if self.state.pins().contains(&id.raw()) {
+            return false;
+        }
+        self.log.push_live(M::pinned(id));
+        self.state.pins_mut().insert(id.raw());
+        true
+    }
+
+    /// Unpins an entity. The next [`collect`](Store::collect) deletes it,
+    /// unless something that's kept refers to it. Returns `false` if it
+    /// wasn't pinned.
+    pub fn unpin<E: Entity>(&mut self, id: Id<E>) -> bool
+    where
+        M: Contains<E>,
+    {
+        if !self.state.pins().contains(&id.raw()) {
+            return false;
+        }
+        self.log.push_live(M::unpinned(id));
+        self.state.pins_mut().remove(&id.raw());
+        true
+    }
+
+    /// Whether an entity is pinned.
+    pub fn is_pinned<E: Entity>(&self, id: Id<E>) -> bool
+    where
+        M: Contains<E>,
+    {
+        self.state.pins().contains(&id.raw())
+    }
+
+    /// Deletes every entity that can't be reached from a pinned one, and
+    /// returns how many were deleted.
+    ///
+    /// An entity is kept if it's pinned, or if a kept entity refers to it
+    /// through a field, a [`List`](crate::List) or a [`Map`](crate::Map) key
+    /// or value, so cycles of entities that nothing kept refers to are
+    /// deleted too. [`Weak`](crate::Weak) references don't keep anything:
+    /// those that point to a deleted entity are set to `None` or removed.
+    /// Every change is logged: first the weak references, then a delete per
+    /// entity.
+    ///
+    /// Call it once new entities are linked in, for example at the end of a
+    /// request. It takes time in proportion to the number of entities and
+    /// references.
+    ///
+    /// Panics if nothing is pinned while there are entities, since that
+    /// would delete them all. Pin the roots first, for example after
+    /// loading a log written before they were pinned.
+    pub fn collect(&mut self) -> usize {
+        assert!(
+            !self.state.pins().is_empty() || self.state.is_empty(),
+            "nothing is pinned, so collect() would delete every entity; pin the roots first"
+        );
+        let mut alive = HashSet::new();
+        let mut todo: Vec<u64> = self.state.pins().iter().copied().collect();
+        while let Some(raw) = todo.pop() {
+            if alive.contains(&raw) {
+                continue;
+            }
+            if self.state.refs_of(raw, &mut |to| todo.push(to)) {
+                alive.insert(raw);
+            }
+        }
+        M::sweep(self, &|raw| alive.contains(&raw))
     }
 
     /// The entity with this id, if it exists.
@@ -361,7 +466,7 @@ impl<M: Model> Store<M> {
     ///
     /// Nothing is ever removed from the log: an edit or a delete only adds
     /// events. So any earlier state can be rebuilt, for example the one just
-    /// before something was deleted. The current store isn't changed.
+    /// before [`collect`](Store::collect) deleted something. The current store isn't changed.
     ///
     /// The events keep their times, and the new store has the same clock.
     ///
@@ -687,4 +792,29 @@ impl<M: Contains<E>, E: Entity> Drop for Edit<'_, M, E> {
             self.entity.changes(before, &mut |c| log.push_live(M::updated(id, c)));
         }
     }
+}
+
+/// The first half of [`Model::sweep`] for one entity type: clears the weak
+/// references to entities that aren't alive, through ordinary edits.
+#[doc(hidden)]
+pub fn clear_dead_weak<M: Contains<E>, E: Entity>(store: &mut Store<M>, alive: &dyn Fn(u64) -> bool) {
+    let ids: Vec<Id<E>> = (store.state.table().iter())
+        .filter(|(id, e)| alive(id.raw()) && e.has_dead_weak(alive))
+        .map(|(id, _)| *id)
+        .collect();
+    for id in ids {
+        store.edit(id).clear_dead_weak(alive);
+    }
+}
+
+/// The second half of [`Model::sweep`] for one entity type: deletes the
+/// entities that aren't alive.
+#[doc(hidden)]
+pub fn delete_dead<M: Contains<E>, E: Entity>(store: &mut Store<M>, alive: &dyn Fn(u64) -> bool) -> usize {
+    let dead: Vec<Id<E>> = store.state.table().keys().filter(|id| !alive(id.raw())).copied().collect();
+    for &id in &dead {
+        store.state.table_mut().remove(&id);
+        store.log.push_live(M::deleted(id));
+    }
+    dead.len()
 }
