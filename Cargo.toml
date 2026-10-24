@@ -1,0 +1,20 @@
+[package]
+name = "replayable"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.74"
+description = "Plain Rust structs whose every change is recorded as an event, and a log that replays to the same state"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+keywords = ["event-sourcing", "change-tracking", "replay", "audit-log", "undo"]
+categories = ["data-structures", "database"]
+exclude = [".idea/", ".github/"]
+
+[dependencies]
+paste = "1.0.15"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[[bench]]
+name = "store"
+harness = false
