@@ -203,7 +203,10 @@ fn replay_matches_live_state() {
             27 => {
                 store.edit(u).status = if rng.below(2) == 0 { Status::Active } else { Status::Away(format!("a{step}")) }
             }
-            28 => store.edit(u).nick = Some(format!("n{}", rng.below(3))).filter(|_| rng.below(3) > 0),
+            28 => {
+                let nick = format!("n{}", rng.below(3));
+                store.edit(u).nick = (rng.below(3) > 0).then_some(nick);
+            }
             _ => match rng.below(60) {
                 0 => store.edit(group).members.clear(),
                 1 => store.edit(group).roles.clear(),

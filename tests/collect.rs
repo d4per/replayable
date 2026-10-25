@@ -404,7 +404,7 @@ fn random_graphs_never_dangle_after_collect() {
             12 => store.edit(f).owners.clear(),
             13 => {
                 if let Some(i) = i {
-                    store.edit(i).vote = Vote { by: Some(g).filter(|_| rng.below(2) == 0) };
+                    store.edit(i).vote = Vote { by: (rng.below(2) == 0).then_some(g) };
                 }
             }
             _ => {
