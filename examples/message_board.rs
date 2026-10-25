@@ -66,8 +66,6 @@ struct Db {
     file: BufWriter<File>,
     /// Whether the file is in the binary format rather than JSON Lines.
     binary: bool,
-    /// How many events of the store are in the file.
-    saved: usize,
 }
 
 /// Reads a log file in either format.
@@ -85,8 +83,7 @@ impl Db {
     fn open(path: &Path, binary: bool) -> Result<Db, Box<dyn std::error::Error>> {
         let store = if path.exists() { load(path, binary)? } else { Store::new() };
         let file = BufWriter::new(OpenOptions::new().create(true).append(true).open(path)?);
-        let saved = store.event_count();
-        let mut db = Db { store, file, binary, saved };
+        let mut db = Db { store, file, binary };
 
         // Files from before pins existed: pin the roots, or `collect` would
         // delete them.
@@ -106,12 +103,11 @@ impl Db {
     /// whole operations in the order they happened.
     fn commit(&mut self) {
         if self.binary {
-            self.store.write_binary_since(self.saved, &mut self.file).expect("writing the log");
+            self.store.save_binary(&mut self.file).expect("writing the log");
         } else {
-            self.store.write_json_since(self.saved, &mut self.file).expect("writing the log");
+            self.store.save_json(&mut self.file).expect("writing the log");
         }
         self.file.flush().expect("writing the log");
-        self.saved = self.store.event_count();
     }
 
     fn create_user(&mut self, name: String) -> Id<User> {

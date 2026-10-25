@@ -214,14 +214,26 @@ macro_rules! model {
                     }
                 }
 
-                fn changes(&mut self, before: Self::Snapshot, emit: &mut dyn ::core::ops::FnMut(Self::Change)) {
+                // Every field is done even if one fails, so that all the
+                // changes that can be stored are logged.
+                #[allow(unused_mut, unused_variables)]
+                fn changes(
+                    &mut self,
+                    before: Self::Snapshot,
+                    emit: &mut dyn ::core::ops::FnMut(Self::Change),
+                ) -> ::core::result::Result<(), ::std::string::String> {
+                    let mut result = ::core::result::Result::Ok(());
                     $(
-                        <$crate::Stored<$ty> as $crate::Field>::changes(
+                        if let ::core::result::Result::Err(e) = <$crate::Stored<$ty> as $crate::Field>::changes(
                             &mut self.$field,
                             before.$field,
                             &mut |op| emit([<$entity Change>]::[<$field:camel>](op)),
-                        );
+                        ) {
+                            result = result.and(::core::result::Result::Err(
+                                ::std::format!("{}: {e}", ::core::stringify!($field))));
+                        }
                     )*
+                    result
                 }
 
                 fn settle(&mut self) {

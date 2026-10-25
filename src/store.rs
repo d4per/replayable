@@ -9,7 +9,7 @@ use std::fmt;
 use std::io::{BufRead, Read, Write};
 use std::ops::{Deref, DerefMut, Index};
 use std::panic::{self, AssertUnwindSafe};
-use std::sync::{Arc, Mutex, PoisonError};
+use std::sync::Arc;
 
 /// An entity type declared in [`model!`](crate::model). Implemented by the
 /// macro; you don't implement it yourself.
@@ -22,8 +22,11 @@ pub trait Entity: Default + Clone + PartialEq + fmt::Debug + 'static {
     type Snapshot;
     /// Taken before an edit.
     fn snapshot(&self) -> Self::Snapshot;
-    /// Emits the changes made since `before` was taken.
-    fn changes(&mut self, before: Self::Snapshot, emit: &mut dyn FnMut(Self::Change));
+    /// Emits the changes made since `before` was taken. A change with a
+    /// value that can't be stored is undone instead of emitted (see
+    /// [`Field::changes`](crate::Field::changes)), and the first reason is
+    /// returned.
+    fn changes(&mut self, before: Self::Snapshot, emit: &mut dyn FnMut(Self::Change)) -> Result<(), String>;
     /// Forgets changes not yet emitted in all `List` and `Map` fields. Used by
     /// `create`, which logs the whole value instead.
     fn settle(&mut self);
@@ -118,8 +121,8 @@ struct Log<M: Model> {
     times: Vec<Timestamp>,
     /// How many events were forgotten, from the start of the log.
     base: usize,
-    /// How many events are in storage: read from it, or flushed to it.
-    /// Never less than `base`.
+    /// How many events are in storage: read from it, or saved or flushed
+    /// to it. Never less than `base`.
     saved: usize,
     /// The time of the last event, forgotten or not.
     last: Option<Timestamp>,
@@ -162,14 +165,18 @@ impl<M: Model> Log<M> {
 
     /// Adds a live event, after checking that it can be stored. In debug
     /// builds it's also checked that it survives a trip through JSON.
-    fn push_live(&mut self, event: M::Event) {
+    /// Returns `false`, without logging it, if it can't be stored and the
+    /// thread is already panicking.
+    fn push_live(&mut self, event: M::Event) -> bool {
         if let Err(reason) = M::check_event(&event) {
             codec::reject(format_args!("can't log `{event}`: {reason}"));
+            return false;
         }
         #[cfg(debug_assertions)]
         codec::assert_round_trip::<M>(&event);
         let at = self.now();
         self.push(at, event);
+        true
     }
 
     fn push(&mut self, at: Timestamp, event: M::Event) {
@@ -247,8 +254,9 @@ pub struct Store<M: Model> {
     /// The raw id of the entity checked out by `update`, for a clear panic
     /// message if the closure tries to read it through the store.
     editing: Option<u64>,
-    /// What's needed to append to the binary file last written or read.
-    binary: Mutex<binary::WriteState>,
+    /// What's needed to append to the binary log in storage: the one the
+    /// store was read from, or saves to.
+    storage: binary::WriteState,
 }
 
 impl<M: Model> Default for Store<M> {
@@ -268,7 +276,7 @@ impl<M: Model> Store<M> {
             last: None,
             clock: Arc::new(Timestamp::now),
         };
-        Store { state: M::default(), log, next_id: 1, editing: None, binary: Mutex::default() }
+        Store { state: M::default(), log, next_id: 1, editing: None, storage: binary::WriteState::default() }
     }
 
     /// Uses `clock` instead of the system clock for the times of new events.
@@ -312,13 +320,20 @@ impl<M: Model> Store<M> {
         let id = Id::from_raw(self.next_id);
         self.next_id += 1;
         value.settle();
-        self.log.push_live(M::created(id, value.clone()));
-        self.state.table_mut().insert(id, value);
+        if self.log.push_live(M::created(id, value.clone())) {
+            self.state.table_mut().insert(id, value);
+        }
         id
     }
 
     /// Gives a plain `&mut E` (through a guard). When the guard is dropped,
     /// the changes become events.
+    ///
+    /// If a value can't be stored (see [`Value::check`](crate::Value::check)),
+    /// the edit panics when the guard is dropped, but the store still matches
+    /// its log: every other change is logged, a field with such a value is
+    /// put back as it was before the edit, and elements and entries of a
+    /// [`List`](crate::List) or [`Map`](crate::Map) that hold one are removed.
     ///
     /// Panics if `id` doesn't exist. See [`try_edit`](Store::try_edit).
     pub fn edit<E: Entity>(&mut self, id: Id<E>) -> Edit<'_, M, E>
@@ -348,6 +363,8 @@ impl<M: Model> Store<M> {
     /// were given instead. If the closure panics, the entity is put back and
     /// the changes made so far are logged.
     ///
+    /// Values that can't be stored are handled as in [`edit`](Store::edit).
+    ///
     /// Panics if `id` doesn't exist. See [`try_update`](Store::try_update).
     pub fn update<E: Entity, R>(&mut self, id: Id<E>, f: impl FnOnce(&mut E, &Self) -> R) -> R
     where
@@ -366,11 +383,18 @@ impl<M: Model> Store<M> {
         let before = entity.snapshot();
         // Even if the closure panics, the entity must go back into the store.
         let result = panic::catch_unwind(AssertUnwindSafe(|| f(&mut entity, &*self)));
-        let log = &mut self.log;
-        entity.changes(before, &mut |c| log.push_live(M::updated(id, c)));
-        self.state.table_mut().insert(id, entity);
+        // Back in the store before anything else can panic.
         self.editing = None;
-        Some(result.unwrap_or_else(|payload| panic::resume_unwind(payload)))
+        let entity = self.state.table_mut().entry(id).or_insert(entity);
+        let log = &mut self.log;
+        let logged = entity.changes(before, &mut |c| {
+            log.push_live(M::updated(id, c));
+        });
+        let value = result.unwrap_or_else(|payload| panic::resume_unwind(payload));
+        if let Err(reason) = logged {
+            reject_edit(id, &reason);
+        }
+        Some(value)
     }
 
     /// Pins an entity, so that [`collect`](Store::collect) keeps it and
@@ -655,10 +679,19 @@ impl<M: Model> Store<M> {
     }
 
     /// Appends the events that aren't in storage yet to a JSON Lines log,
-    /// then forgets them, so that the log doesn't have to stay in memory.
-    /// See [`flush_binary`](Store::flush_binary), which works the same way.
-    pub fn flush_json(&mut self, writer: impl Write) -> std::io::Result<()> {
+    /// and keeps them in memory. See [`save_binary`](Store::save_binary),
+    /// which works the same way.
+    pub fn save_json(&mut self, writer: impl Write) -> std::io::Result<()> {
         self.write_json_since(self.log.saved, writer)?;
+        self.log.saved = self.log.len();
+        Ok(())
+    }
+
+    /// Like [`save_json`](Store::save_json), but then forgets the events, so
+    /// that the log doesn't have to stay in memory. See
+    /// [`flush_binary`](Store::flush_binary), which works the same way.
+    pub fn flush_json(&mut self, writer: impl Write) -> std::io::Result<()> {
+        self.save_json(writer)?;
         self.log.forget_before(self.log.len());
         Ok(())
     }
@@ -669,7 +702,7 @@ impl<M: Model> Store<M> {
     ///
     /// For storing events your own way. The events are in storage after
     /// they were read with one of the `read_*`, `from_*` and `resume_*`
-    /// methods, or flushed.
+    /// methods, or saved or flushed.
     ///
     /// ```
     /// # use replayable::{model, Store};
@@ -805,7 +838,7 @@ impl<M: Model> Store<M> {
         }
     }
 
-    /// Writes the log in the compact binary format, usually a third of the
+    /// Writes the log in the compact binary format, usually a quarter of the
     /// size of the JSON and faster to read and write. The format is described
     /// in the [crate documentation](crate#binary-layout).
     ///
@@ -813,19 +846,23 @@ impl<M: Model> Store<M> {
     /// version of the model can read it the same way (see
     /// [`read_json`](Store::read_json)). Each name is written in full only
     /// once per file.
+    ///
+    /// This doesn't change which events are in storage, so it's the way to
+    /// write a copy, like a backup. To start a log that you'll keep appending
+    /// to, use [`save_binary`](Store::save_binary) instead.
     pub fn write_binary(&self, writer: impl Write) -> std::io::Result<()> {
         self.write_binary_since(0, writer)
     }
 
     /// Like [`write_binary`](Store::write_binary), but only the events after
-    /// the first `n`. Use it to append to a file that holds the first `n`
-    /// events, as written or read by this store.
+    /// the first `n`, to append to a file that holds the first `n` events.
+    /// With `n == 0`, the start of a new file is written.
     ///
-    /// The store remembers which names the file it last wrote to or read
-    /// from has defined, so an append usually doesn't repeat them. If `n`
-    /// doesn't match that file, the append starts by resetting the names
-    /// instead, which is always safe. With `n == 0`, the start of a new file
-    /// is written.
+    /// The store can't know which names a file it didn't read or save to
+    /// defines, so what's appended starts by resetting them, and defines
+    /// again those it uses. That's always right, but takes some room. To
+    /// append to the same file again and again, use
+    /// [`save_binary`](Store::save_binary), which doesn't repeat names.
     ///
     /// ```
     /// # use replayable::{model, Store};
@@ -848,21 +885,57 @@ impl<M: Model> Store<M> {
     /// events after the first `n` were forgotten.
     pub fn write_binary_since(&self, n: usize, writer: impl Write) -> std::io::Result<()> {
         let i = self.log.index(n);
-        let mut state = self.binary.lock().unwrap_or_else(PoisonError::into_inner);
-        binary::write::<M>(&mut state, n, n == 0, &self.log.times[i..], &self.log.events[i..], writer)
+        // Nothing is known about this file but how many events it holds.
+        let state = &mut binary::WriteState::default();
+        binary::write::<M>(state, n, n == 0, &self.log.times[i..], &self.log.events[i..], writer)
     }
 
-    /// Appends the events that aren't in storage yet to a binary log, then
-    /// forgets them, so that the log doesn't have to stay in memory.
+    /// Appends the events that aren't in storage yet to a binary log, and
+    /// keeps them in memory. Use it to keep a log file up to date, for
+    /// example at the end of each operation.
     ///
     /// The events are in storage once they were read with one of the
-    /// `read_*`, `from_*` and `resume_*` methods, or flushed. So this writes
-    /// the events logged since the store was read or last flushed, to the
-    /// same log. A new store starts a new log, with the header.
+    /// `read_*`, `from_*` and `resume_*` methods, or saved or flushed. So
+    /// this writes the events logged since the store was read or last
+    /// saved, to the same log. A new store starts a new log, with the
+    /// header. The store remembers which names that log defines, so they
+    /// aren't written again.
     ///
-    /// The events are only forgotten if writing succeeds. If it fails, the
-    /// writer may hold part of an event, which must be removed before trying
-    /// again; [`LogFile`](crate::LogFile) does that for files.
+    /// Only use it for that one log: [`write_binary`](Store::write_binary)
+    /// writes a copy somewhere else, and doesn't count as saving.
+    ///
+    /// If writing fails, the events stay unsaved, and the writer may hold
+    /// part of an event, which must be removed before trying again;
+    /// [`LogFile`](crate::LogFile) does that for files.
+    ///
+    /// ```
+    /// # use replayable::{model, Store};
+    /// # model! { pub World { User { name: String } } }
+    /// let mut store = Store::<World>::new();
+    /// let mut file = Vec::new(); // a File, or any other `io::Write`
+    /// let u = store.create(User { name: "a".into() });
+    /// store.save_binary(&mut file)?;
+    ///
+    /// store.edit(u).name = "b".into();
+    /// store.save_binary(&mut file)?;
+    ///
+    /// let loaded = Store::<World>::from_binary(&file)?;
+    /// assert_eq!(loaded.events(), store.events());
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn save_binary(&mut self, writer: impl Write) -> std::io::Result<()> {
+        let n = self.log.saved;
+        let i = self.log.index(n);
+        let header = !self.storage.has_header;
+        binary::write::<M>(&mut self.storage, n, header, &self.log.times[i..], &self.log.events[i..], writer)?;
+        self.log.saved = self.log.len();
+        Ok(())
+    }
+
+    /// Like [`save_binary`](Store::save_binary), but then forgets the events,
+    /// so that the log doesn't have to stay in memory.
+    ///
+    /// The events are only forgotten if writing succeeds.
     ///
     /// ```
     /// # use replayable::{model, Store};
@@ -882,11 +955,7 @@ impl<M: Model> Store<M> {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     pub fn flush_binary(&mut self, writer: impl Write) -> std::io::Result<()> {
-        let n = self.log.saved;
-        let i = self.log.index(n);
-        let state = self.binary.get_mut().unwrap_or_else(PoisonError::into_inner);
-        let header = !state.has_header;
-        binary::write::<M>(state, n, header, &self.log.times[i..], &self.log.events[i..], writer)?;
+        self.save_binary(writer)?;
         self.log.forget_before(self.log.len());
         Ok(())
     }
@@ -898,9 +967,7 @@ impl<M: Model> Store<M> {
     pub fn to_binary(&self) -> std::io::Result<Vec<u8>> {
         self.log.index(0);
         let mut out = Vec::new();
-        // Not the store's own state, which is about the file it writes to.
-        let state = &mut binary::WriteState::default();
-        binary::write::<M>(state, 0, true, &self.log.times, &self.log.events, &mut out)?;
+        self.write_binary(&mut out)?;
         Ok(out)
     }
 
@@ -946,7 +1013,7 @@ impl<M: Model> Store<M> {
         if end.complete > 0 {
             end.state.upto = Some(store.log.len());
         }
-        *store.binary.get_mut().unwrap_or_else(PoisonError::into_inner) = std::mem::take(&mut end.state);
+        store.storage = std::mem::take(&mut end.state);
         Ok((store, end))
     }
 
@@ -1037,9 +1104,21 @@ impl<M: Contains<E>, E: Entity> Drop for Edit<'_, M, E> {
     fn drop(&mut self) {
         if let Some(before) = self.before.take() {
             let (id, log) = (self.id, &mut *self.log);
-            self.entity.changes(before, &mut |c| log.push_live(M::updated(id, c)));
+            let logged = self.entity.changes(before, &mut |c| {
+                log.push_live(M::updated(id, c));
+            });
+            if let Err(reason) = logged {
+                reject_edit(id, &reason);
+            }
         }
     }
+}
+
+/// Panics about an edit with a value that couldn't be stored, unless the
+/// thread is already panicking. The rest of the edit was logged.
+#[track_caller]
+fn reject_edit<E: Entity>(id: Id<E>, reason: &str) {
+    codec::reject(format_args!("can't log the edit of {id:?}: {reason}. The other changes were logged."));
 }
 
 /// The first half of [`Model::sweep`] for one entity type: clears the weak

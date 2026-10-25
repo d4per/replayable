@@ -260,24 +260,29 @@ Fields are written by name, so their order in the model doesn't matter.
 Times are ISO 8601 in UTC, to the millisecond, and are available as
 [`Timestamp`]s from [`Store::timestamps`].
 
-Since the log only grows, you can append to a file instead of rewriting it:
+Since the log only grows, you can append to a file instead of rewriting it.
+The store keeps track of which events are in storage: those it was read
+from, and those it saved. [`Store::save_json`] appends the rest:
 
 ```rust,no_run
 # use replayable::{model, Store};
 # model! { pub World { User { name: String } } }
 use std::fs::{File, OpenOptions};
-use std::io::{BufReader, BufWriter};
+use std::io::{BufReader, BufWriter, Write};
 
 let mut store = Store::<World>::read_json(BufReader::new(File::open("log.jsonl")?))?;
-let mut saved = store.event_count();
+let mut file = BufWriter::new(OpenOptions::new().append(true).open("log.jsonl")?);
 
 // ... make changes ...
 
-let file = OpenOptions::new().append(true).open("log.jsonl")?;
-store.write_json_since(saved, BufWriter::new(file))?;
-saved = store.event_count();
+store.save_json(&mut file)?;
+file.flush()?; // a BufWriter that's dropped ignores errors
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
+
+[`Store::write_json`] writes the whole log, for example as a copy
+somewhere else, and [`Store::write_json_since`] the events after the first
+`n`. Neither changes what's in storage.
 
 [`Store::apply_event_at`] applies events one at a time, with their times.
 Use it to keep a second store in sync with one that's making the changes.
@@ -285,9 +290,9 @@ Use it to keep a second store in sync with one that's making the changes.
 ### The binary format
 
 If the log gets big, it can be written in a compact binary format instead,
-with methods like the JSON ones: [`Store::write_binary`],
-[`Store::write_binary_since`] for appending, [`Store::read_binary`],
-[`Store::to_binary`] and [`Store::from_binary`]. It holds the same events, and the
+with methods like the JSON ones: [`Store::save_binary`] for appending,
+[`Store::write_binary`], [`Store::read_binary`], [`Store::to_binary`] and
+[`Store::from_binary`]. It holds the same events, and the
 names of fields and entity types, so changing the model works the same way.
 But each name is written in full only once per file, numbers are binary,
 and each time is a small difference from the time before.
@@ -312,9 +317,12 @@ assert_eq!(json.to_binary()?, bytes);
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
-Appending works as with JSON: pass the number of events already in the
-file. The store remembers the names the file defines, from writing or
-reading it, so they aren't written again. JSON is easier to read and edit
+Appending works as with JSON. The store remembers the names its log in
+storage defines, from reading or saving it, so `save_binary` doesn't write
+them again. [`Store::write_binary_since`] can append to any file that
+holds the first `n` events, but since the store doesn't know which names
+that file defines, it starts what it appends by defining them again. JSON
+is easier to read and edit
 by hand, and to process with other tools; the binary format needs this
 crate (or its [layout](#binary-layout)).
 
@@ -327,7 +335,7 @@ a log that grows for years, only the state needs to be in memory:
 - [`Store::resume_binary`] and [`Store::resume_json`] replay a log as it is
   read, without keeping its events. Reading is done a chunk at a time, so
   memory use depends on the size of the state, not of the log.
-- [`Store::flush_binary`] and [`Store::flush_json`] append the events that
+- [`Store::flush_binary`] and [`Store::flush_json`] save the events that
   aren't in storage yet, then forget them. Errors are returned from the
   flush, so `create` and `edit` still can't fail. Call it at the end of
   each operation, or every so often.
@@ -444,7 +452,7 @@ Using the same name twice (say, as a field and as removed) is a compile
 error. Skipped events aren't kept in [`Store::events`], so writing the whole
 log again with [`Store::write_json`] drops them for good. A rewrite also
 writes every field of every create, which fixes the defaults the log was
-read with. Appending with `write_json_since` keeps the old lines as they are.
+read with. Appending with `save_json` keeps the old lines as they are.
 
 A default (`= value`) is evaluated each time an old entity is replayed, so
 make it a constant, not something like the current time.
@@ -471,7 +479,7 @@ later:
 
 | Mistake | Caught by |
 |---|---|
-| NaN or infinity in an `f32`/`f64` field, list or map (JSON writes them as `null`, which can't be read back) | [`Value::check`]: the edit panics. Override `check` in your own types that hold floats. |
+| NaN or infinity in an `f32`/`f64` field, list or map (JSON writes them as `null`, which can't be read back), or `Some(None)` in an `Option<Option<T>>` (written as `null`, like `None`) | [`Value::check`]: the edit panics. The store still matches its log: the other changes are logged, the field goes back to its value before the edit, and list elements or map entries that hold such a value are removed. Override `check` in your own types that hold floats. |
 | A value type whose serde loses data (`#[serde(skip)]`, a lossy format), or that can't be written as JSON (a map with non-string keys) | Debug builds: every logged change is written as JSON, read back and compared, and the edit panics if they differ. |
 | State changed without an edit, through a `Cell` or `RefCell` in a value | [`Store::verify`], which replays the log and compares it with the live state. Call it in your tests. |
 | A `PartialEq` that ignores some fields | Nothing. A change to only those fields isn't seen, so it isn't logged. |
@@ -620,6 +628,9 @@ conditions.
 [`Store::as_of`]: https://docs.rs/replayable/latest/replayable/struct.Store.html#method.as_of
 [`Store::write_binary`]: https://docs.rs/replayable/latest/replayable/struct.Store.html#method.write_binary
 [`Store::write_binary_since`]: https://docs.rs/replayable/latest/replayable/struct.Store.html#method.write_binary_since
+[`Store::save_binary`]: https://docs.rs/replayable/latest/replayable/struct.Store.html#method.save_binary
+[`Store::save_json`]: https://docs.rs/replayable/latest/replayable/struct.Store.html#method.save_json
+[`Store::write_json_since`]: https://docs.rs/replayable/latest/replayable/struct.Store.html#method.write_json_since
 [`Store::to_binary`]: https://docs.rs/replayable/latest/replayable/struct.Store.html#method.to_binary
 [`Store::from_binary`]: https://docs.rs/replayable/latest/replayable/struct.Store.html#method.from_binary
 [`Store::read_binary`]: https://docs.rs/replayable/latest/replayable/struct.Store.html#method.read_binary

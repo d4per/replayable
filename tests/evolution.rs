@@ -262,13 +262,14 @@ fn a_newer_model_reads_an_older_binary_log() {
     assert_eq!(store.timestamps(), from_json.timestamps());
 
     // Appending with the new model: new names after the old ones, which are
-    // still defined in the file.
-    let saved = store.events().len();
+    // still defined in the file. Writing a copy first, where the names have
+    // other numbers since the removed ones aren't in it, changes nothing.
     let p = store.create(Person { title: "new".into() });
     assert_eq!(p.raw(), 5, "ids of removed entities are not reused");
     let c = store.create(User { name: "c".into(), level: 7, ..Default::default() });
     store.edit(c).nickname = Some("cee".into());
-    store.write_binary_since(saved, &mut file).unwrap();
+    store.write_binary(&mut Vec::new()).unwrap();
+    store.save_binary(&mut file).unwrap();
 
     let again = Store::<World>::from_binary(&file).unwrap();
     assert_eq!(again.events(), store.events());

@@ -599,6 +599,66 @@ fn infinity_in_a_list_is_rejected() {
 }
 
 #[test]
+fn a_rejected_value_is_undone_and_the_rest_is_logged() {
+    replayable::model! { Floats { Point { name: String, x: f64, xs: List<f64>, by: Map<u8, f64> } } }
+    let mut store = Store::<Floats>::new();
+    let p = store.create(Point { x: 1.0, xs: vec![1.0, 2.0].into(), ..Default::default() });
+    let rejected = |store: &mut Store<Floats>, f: &dyn Fn(&mut Point)| {
+        let result = panic::catch_unwind(AssertUnwindSafe(|| f(&mut store.edit(p))));
+        let message = *result.unwrap_err().downcast::<String>().unwrap();
+        assert_eq!(store.verify(), Ok(()), "after {message}");
+        message
+    };
+
+    let message = rejected(&mut store, &|p| {
+        p.name = "a".into();
+        p.x = f64::NAN;
+        p.xs.push(3.0);
+    });
+    assert!(message.contains("x: NaN can't be stored"), "{message}");
+    assert_eq!(store[p].x, 1.0);
+    assert_eq!((store[p].name.as_str(), store[p].xs.as_slice()), ("a", &[1.0, 2.0, 3.0][..]));
+
+    rejected(&mut store, &|p| {
+        p.xs.push(f64::NAN);
+        p.xs[0] = f64::INFINITY;
+        p.xs.push(4.0);
+    });
+    assert_eq!(store[p].xs.as_slice(), [2.0, 3.0, 4.0]);
+    rejected(&mut store, &|p| p.xs = vec![5.0, f64::NAN].into());
+    assert_eq!(store[p].xs.as_slice(), [5.0]);
+    // Through DerefMut, found by the diff.
+    rejected(&mut store, &|p| p.xs.as_mut_slice()[0] = f64::NAN);
+    assert!(store[p].xs.is_empty());
+    rejected(&mut store, &|p| {
+        p.by.insert(1, 1.0);
+        p.by.insert(2, f64::NAN);
+    });
+    assert_eq!(store[p].by.iter().collect::<Vec<_>>(), [(&1, &1.0)]);
+}
+
+#[test]
+fn a_rejected_value_in_update_keeps_the_entity() {
+    replayable::model! { Floats { Point { x: f64 } } }
+    let mut store = Store::<Floats>::new();
+    let p = store.create(Point::default());
+    let result = panic::catch_unwind(AssertUnwindSafe(|| store.update(p, |p, _| p.x = f64::NAN)));
+    assert!(result.is_err());
+    assert_eq!(store[p].x, 0.0);
+    assert_eq!(store.verify(), Ok(()));
+}
+
+#[test]
+#[should_panic(expected = "Some(None) can't be stored")]
+fn some_none_is_rejected() {
+    replayable::model! { Nested { Thing { maybe: Option<Option<u8>> } } }
+    let mut store = Store::<Nested>::new();
+    let t = store.create(Thing::default());
+    store.edit(t).maybe = Some(Some(1));
+    store.edit(t).maybe = Some(None);
+}
+
+#[test]
 #[should_panic(expected = "can't log")]
 fn nan_at_create_is_rejected() {
     replayable::model! { Floats { Point { x: f64 } } }

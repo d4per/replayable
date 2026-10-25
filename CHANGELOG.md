@@ -22,15 +22,17 @@ First release.
   edit are merged into a single `ListOp::Splice`.
 - Replay that checks every event and reports corrupt logs as `Error`
   instead of panicking.
-- JSON Lines persistence: `write_json`, `write_json_since` for appending,
-  `read_json`, `to_json`, `from_json`, and `apply_event` for following
-  another store's log.
+- JSON Lines persistence: `save_json` for appending to the log in storage,
+  `write_json` and `write_json_since` for copies, `read_json`, `to_json`,
+  `from_json`, and `apply_event` for following another store's log.
 - Schema changes: fields with `= default`, renames with `(was old)`, and
   removed fields and entity types declared with `#![removed(..)]`. Unknown
   names in a log are an error.
 - `create` logs the whole value as one event, so later changes to a
   default don't change history.
-- `Value::check` rejects NaN and infinite floats, debug builds check that
+- `Value::check` rejects NaN and infinite floats, and `Some(None)`. An
+  edit with such a value panics, but the store still matches its log: the
+  value is undone and the other changes are logged. Debug builds check that
   every logged change survives a trip through JSON, and `Store::verify`
   compares a replay with the live state.
 - `Store::as_of(n)` rebuilds the state after the first `n` events, for
@@ -43,14 +45,14 @@ First release.
   `Store::apply_event_at` and `Store::with_clock` (for tests). Times never
   go backwards in a log.
 - A compact binary log format, usually a quarter of the size of the JSON:
-  `Store::write_binary`, `write_binary_since`, `read_binary`, `to_binary`
-  and `from_binary`. It's self-describing like the JSON, so model changes
-  work the same way, and appending doesn't repeat names already in the
-  file. Errors in it are `Error::Binary`. `Timestamp` is written as a
+  `Store::save_binary`, `write_binary`, `write_binary_since`,
+  `read_binary`, `to_binary` and `from_binary`. It's self-describing like
+  the JSON, so model changes work the same way, and appending with
+  `save_binary` doesn't repeat names already in the log. Errors in it are `Error::Binary`. `Timestamp` is written as a
   number in non-human-readable serde formats.
 - Keeping only the state in memory: `Store::resume_binary` and
   `resume_json` replay a log without keeping its events, and
-  `Store::flush_binary`, `flush_json` and `flush_with` write the events that
+  `Store::flush_binary`, `flush_json` and `flush_with` save the events that
   aren't in storage yet and forget them. `Store::forget_events` forgets
   them without writing, and `Store::event_count` counts all events,
   forgotten ones included. The `*_since(n)` methods count from the start of

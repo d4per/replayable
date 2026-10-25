@@ -212,22 +212,41 @@ impl<K: fmt::Debug, V: fmt::Debug> fmt::Debug for Map<K, V> {
     }
 }
 
+impl<K: Value + Ord, V: Value> Map<K, V> {
+    /// Emits the whole contents, replacing what was there.
+    fn log_in_full(&mut self, emit: &mut dyn FnMut(MapOp<K, V>)) {
+        self.settle();
+        emit(MapOp::Clear);
+        self.items.iter().for_each(|(k, v)| emit(MapOp::Insert(k.clone(), v.clone())));
+    }
+}
+
 impl<K: Value + Ord, V: Value> Field for Map<K, V> {
     type Op = MapOp<K, V>;
     type Snapshot = u64;
     fn snapshot(&self) -> u64 {
         self.origin
     }
-    fn changes(&mut self, origin: u64, emit: &mut dyn FnMut(MapOp<K, V>)) {
-        if self.origin != origin {
-            // A different map: log the new contents in full.
-            self.settle();
-            emit(MapOp::Clear);
-            self.items.iter().for_each(|(k, v)| emit(MapOp::Insert(k.clone(), v.clone())));
-        } else {
+    fn changes(&mut self, origin: u64, emit: &mut dyn FnMut(MapOp<K, V>)) -> Result<(), String> {
+        let replaced = self.origin != origin;
+        if !replaced {
             self.flush();
+        }
+        let checked = if replaced { Self::check(self) } else { self.pending.iter().try_for_each(Self::check_op) };
+        if let Err(reason) = checked {
+            // Like `List`: without the new entries that can't be stored, the
+            // map is logged in full.
+            self.items.retain(|k, v| Value::check(k).is_ok() && Value::check(v).is_ok());
+            self.log_in_full(emit);
+            return Err(format!("{reason}; the entries that hold one were removed"));
+        }
+        if replaced {
+            // A different map: log the new contents in full.
+            self.log_in_full(emit);
+        } else {
             std::mem::take(&mut self.pending).into_iter().for_each(emit);
         }
+        Ok(())
     }
     fn settle(&mut self) {
         self.pending = Vec::new();

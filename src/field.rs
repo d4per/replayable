@@ -30,12 +30,15 @@ use std::marker::PhantomData;
 /// value is changed rather than when the log is loaded.
 pub trait Value: Clone + PartialEq + fmt::Debug + Serialize + DeserializeOwned {
     /// Checks that the value can be stored, before it's logged. A value that
-    /// fails makes the edit panic with the message.
+    /// fails makes the edit panic with the message, after undoing the change
+    /// (see [`Store::edit`](crate::Store::edit)), so that the store still
+    /// matches its log.
     ///
     /// Accepts everything by default. `f32` and `f64` reject NaN and
     /// infinity, which JSON can't represent (serde_json writes them as `null`,
-    /// which can't be read back). Override it in your own types if they hold
-    /// floats or have other invariants:
+    /// which can't be read back). `Option` rejects `Some(None)`, which JSON
+    /// writes as `null`, the same as `None`. Override it in your own types if
+    /// they hold floats or have other invariants:
     ///
     /// ```
     /// # use serde::{Deserialize, Serialize};
@@ -78,6 +81,13 @@ pub trait Value: Clone + PartialEq + fmt::Debug + Serialize + DeserializeOwned {
     fn refs(&self, visit: &mut dyn FnMut(u64)) {
         let _ = visit;
     }
+
+    /// Whether the value is written as JSON's `null`, like `None`. Used to
+    /// reject `Some(None)`, which JSON can't tell apart from `None`.
+    #[doc(hidden)]
+    fn is_null(&self) -> bool {
+        false
+    }
 }
 
 macro_rules! impl_value {
@@ -102,7 +112,16 @@ impl_value_float!(f32, f64);
 
 impl<T: Value> Value for Option<T> {
     fn check(&self) -> Result<(), String> {
-        self.as_ref().map_or(Ok(()), T::check)
+        match self {
+            Some(value) if value.is_null() => {
+                Err(format!("{self:?} can't be stored, since JSON writes it as null, the same as None"))
+            }
+            Some(value) => value.check(),
+            None => Ok(()),
+        }
+    }
+    fn is_null(&self) -> bool {
+        self.is_none()
     }
     fn refs(&self, visit: &mut dyn FnMut(u64)) {
         if let Some(value) = self {
@@ -305,7 +324,13 @@ pub trait Field: Default + PartialEq + fmt::Debug + Serialize + DeserializeOwned
     /// Taken before an edit.
     fn snapshot(&self) -> Self::Snapshot;
     /// Emits the changes made since `before` was taken.
-    fn changes(&mut self, before: Self::Snapshot, emit: &mut dyn FnMut(Self::Op));
+    ///
+    /// A change with a value that can't be stored (see [`Value::check`]) is
+    /// undone instead of emitted, so that the field still matches what was
+    /// logged, and the reason is returned. A plain value goes back to
+    /// `before`; a [`List`] or [`Map`] loses the elements or entries that
+    /// hold such a value, and is then logged in full.
+    fn changes(&mut self, before: Self::Snapshot, emit: &mut dyn FnMut(Self::Op)) -> Result<(), String>;
     /// Forgets changes not yet emitted. Used by `create`, which logs the
     /// whole value instead.
     fn settle(&mut self);
@@ -327,10 +352,17 @@ impl<T: Value + Default> Field for T {
     fn snapshot(&self) -> T {
         self.clone()
     }
-    fn changes(&mut self, before: T, emit: &mut dyn FnMut(T)) {
-        if *self != before {
-            emit(self.clone());
+    fn changes(&mut self, before: T, emit: &mut dyn FnMut(T)) -> Result<(), String> {
+        if *self == before {
+            return Ok(());
         }
+        if let Err(reason) = Value::check(self) {
+            let reason = format!("{reason}; it was put back to {before:?}");
+            *self = before;
+            return Err(reason);
+        }
+        emit(self.clone());
+        Ok(())
     }
     fn settle(&mut self) {}
     fn apply(&mut self, op: &T) -> Result<(), String> {

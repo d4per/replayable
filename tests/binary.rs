@@ -133,14 +133,12 @@ fn appending_gives_the_same_bytes_as_writing_it_all() {
     let full = sample();
     let mut store = Store::<World>::new();
     let mut file = Vec::new();
-    let mut saved = 0;
-    // Replays the sample a few events at a time, appending after each step.
+    // Replays the sample a few events at a time, saving after each step.
     for chunk in full.timestamps().iter().zip(full.events()).collect::<Vec<_>>().chunks(3) {
         for &(&at, event) in chunk {
             store.apply_event_at(at, event.clone()).unwrap();
         }
-        store.write_binary_since(saved, &mut file).unwrap();
-        saved = store.events().len();
+        store.save_binary(&mut file).unwrap();
     }
     // The names were never repeated, and nothing was reset.
     assert_eq!(file, full.to_binary().unwrap());
@@ -151,12 +149,13 @@ fn a_reopened_log_can_be_appended_to() {
     let mut file = sample().to_binary().unwrap();
     for round in 0..3 {
         let mut store = Store::<World>::read_binary(file.as_slice()).unwrap();
-        let saved = store.events().len();
         let (u, _) = store.all::<User>().next().unwrap();
         store.edit(u).notes.insert(format!("round {round}"), "new name, new key".into());
         store.create(Topic { title: format!("round {round}"), ..Default::default() });
         let before = file.len();
-        store.write_binary_since(saved, &mut file).unwrap();
+        // A backup doesn't change what the store knows about its own log.
+        store.write_binary(&mut Vec::new()).unwrap();
+        store.save_binary(&mut file).unwrap();
         // No reset: a reset is the byte 0 at the start of what was appended.
         assert_ne!(file[before], 0);
 
@@ -184,7 +183,26 @@ fn appending_to_a_file_the_store_does_not_know_starts_with_a_reset() {
     let saved = store.events().len();
     store.create(Topic::default());
     store.write_binary(&mut other).unwrap();
+    let before = file.len();
     store.write_binary_since(saved, &mut file).unwrap();
+    assert_eq!(file[before], 0, "a reset comes first, even right after writing all of it elsewhere");
+    assert_same(&store, &Store::from_binary(&file).unwrap());
+}
+
+#[test]
+fn writing_a_copy_doesnt_change_the_log_in_storage() {
+    let mut store = sample();
+    let mut copy = Vec::new();
+    store.write_binary(&mut copy).unwrap();
+    // A new store's log starts with the header, even after a copy was written.
+    let mut file = Vec::new();
+    store.save_binary(&mut file).unwrap();
+    assert_eq!(file, copy);
+    // And what's saved isn't saved again.
+    let (u, _) = store.all::<User>().next().unwrap();
+    store.edit(u).score += 1;
+    store.write_binary(&mut copy).unwrap();
+    store.save_binary(&mut file).unwrap();
     assert_same(&store, &Store::from_binary(&file).unwrap());
 }
 

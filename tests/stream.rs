@@ -171,9 +171,8 @@ fn reset_records_are_read_in_chunks() {
     for i in 0..10 {
         step(&mut store, i);
     }
-    // Writing elsewhere makes the store forget what the file holds, so the
+    // The store doesn't know what names a file it only wrote holds, so the
     // append starts with a reset.
-    store.write_binary(&mut Vec::new()).unwrap();
     store.write_binary_since(saved, &mut file).unwrap();
     let streamed = Store::<World>::read_binary(Trickle(&file, 5)).unwrap();
     assert_eq!(streamed.events(), store.events());

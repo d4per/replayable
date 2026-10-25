@@ -400,24 +400,43 @@ impl<T: fmt::Debug> fmt::Debug for List<T> {
     }
 }
 
+impl<T: Value> List<T> {
+    /// Emits the whole contents, replacing what was there.
+    fn log_in_full(&mut self, emit: &mut dyn FnMut(ListOp<T>)) {
+        self.settle();
+        emit(ListOp::Clear);
+        if !self.items.is_empty() {
+            emit(ListOp::splice(0, 0, self.items.clone()));
+        }
+    }
+}
+
 impl<T: Value> Field for List<T> {
     type Op = ListOp<T>;
     type Snapshot = u64;
     fn snapshot(&self) -> u64 {
         self.origin
     }
-    fn changes(&mut self, origin: u64, emit: &mut dyn FnMut(ListOp<T>)) {
-        if self.origin != origin {
-            // A different list: log the new contents in full.
-            self.settle();
-            emit(ListOp::Clear);
-            if !self.items.is_empty() {
-                emit(ListOp::splice(0, 0, self.items.clone()));
-            }
-        } else {
+    fn changes(&mut self, origin: u64, emit: &mut dyn FnMut(ListOp<T>)) -> Result<(), String> {
+        let replaced = self.origin != origin;
+        if !replaced {
             self.flush();
+        }
+        let checked = if replaced { Self::check(self) } else { self.pending.iter().try_for_each(Self::check_op) };
+        if let Err(reason) = checked {
+            // Only values added in this edit can fail, since the others were
+            // logged. Without them, the list is logged in full.
+            self.items.retain(|value| Value::check(value).is_ok());
+            self.log_in_full(emit);
+            return Err(format!("{reason}; the elements that hold one were removed"));
+        }
+        if replaced {
+            // A different list: log the new contents in full.
+            self.log_in_full(emit);
+        } else {
             std::mem::take(&mut self.pending).into_iter().for_each(emit);
         }
+        Ok(())
     }
     fn settle(&mut self) {
         self.pending = Vec::new();
