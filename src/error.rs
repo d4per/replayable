@@ -25,11 +25,33 @@ pub enum Error {
     /// for example an update to an entity that doesn't exist or a list index
     /// out of range. This means the log is corrupt or was changed by hand.
     InvalidEvent {
-        /// The position of the event in the log, starting at 0.
+        /// The number of events before it, as [`Store::as_of`](crate::Store::as_of)
+        /// counts them: blank lines and events skipped for a removed field or
+        /// entity type aren't counted.
         index: usize,
+        /// Where the event is in the file, if it was read from one.
+        at: Option<Position>,
         /// What was wrong.
         reason: String,
     },
+}
+
+/// Where an event is in a log file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Position {
+    /// A line of a JSON Lines log, starting at 1.
+    Line(usize),
+    /// The byte offset of an event in a binary log.
+    Offset(u64),
+}
+
+impl fmt::Display for Position {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            Position::Line(line) => write!(f, "line {line}"),
+            Position::Offset(offset) => write!(f, "byte {offset}"),
+        }
+    }
 }
 
 impl fmt::Display for Error {
@@ -38,7 +60,10 @@ impl fmt::Display for Error {
             Error::Io(e) => write!(f, "couldn't read the log: {e}"),
             Error::Json { line, source } => write!(f, "invalid event on line {line}: {source}"),
             Error::Binary { offset, reason } => write!(f, "invalid binary log at byte {offset}: {reason}"),
-            Error::InvalidEvent { index, reason } => write!(f, "event {index} can't be applied: {reason}"),
+            Error::InvalidEvent { index, at: None, reason } => write!(f, "event {index} can't be applied: {reason}"),
+            Error::InvalidEvent { index, at: Some(at), reason } => {
+                write!(f, "event {index}, at {at}, can't be applied: {reason}")
+            }
         }
     }
 }

@@ -38,6 +38,15 @@ First release.
 - `Store::as_of(n)` rebuilds the state after the first `n` events, for
   example to see something as it was before it was deleted.
 - `List` can be indexed with ranges (`list[a..b]`), like a `Vec`.
+- Tuples of up to six values and arrays of up to 32 are `Value`s.
+- `Error::InvalidEvent` says where in the file the event is, with
+  `at: Option<Position>`: a line of a JSON log or a byte offset of a binary
+  one.
+- `Store::verify` also reports references to entities that don't exist.
+  Loading a log rejects a create whose id is used by an entity of another
+  type.
+- `LogFile::append` refuses to write if the store isn't the one it was
+  opened with, or if its events were saved, flushed or forgotten elsewhere.
 - Every event is logged with its time, a `Timestamp` to the millisecond,
   written first on each line as ISO 8601 UTC:
   `{"at":"2026-10-24T09:15:02.123Z","CreateUser":[..]}`. The time is

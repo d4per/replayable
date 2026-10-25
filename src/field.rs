@@ -5,8 +5,10 @@ use std::marker::PhantomData;
 
 /// A plain value that is stored as is and replaced as a whole when it changes.
 ///
-/// Implemented for strings, numbers, `bool`, `char`, `Option<T>` and [`Id`].
-/// Your own types (an enum, a small struct) opt in with an empty impl:
+/// Implemented for strings, numbers, `bool`, `char`, `Option<T>`, tuples of
+/// up to six values, arrays of up to 32, [`Id`] and
+/// [`Timestamp`](crate::Timestamp). Your own types (an enum, a small struct)
+/// opt in with an empty impl:
 ///
 /// ```
 /// use serde::{Deserialize, Serialize};
@@ -23,6 +25,10 @@ use std::marker::PhantomData;
 /// `Default` isn't required by `Value` itself, but a type needs it to be used
 /// directly as a field in [`model!`](crate::model). Inside a [`List`] or as
 /// a [`Map`] key or value, it's not needed.
+///
+/// `Vec` and `BTreeMap` aren't values: a change to one would log the whole
+/// collection. Use [`List`] and [`Map`], which log each change, or put one
+/// inside your own value type if logging it whole is what you want.
 ///
 /// The `Serialize`/`Deserialize` impls must give back an equal value, or a
 /// replay won't match. In debug builds every logged change is checked for
@@ -129,6 +135,42 @@ impl<T: Value> Value for Option<T> {
         }
     }
 }
+// Tuples and arrays hold values, so they check and visit each of them.
+macro_rules! impl_value_tuple {
+    ($(($($t:ident $i:tt),+))*) => { $(
+        impl<$($t: Value),+> Value for ($($t,)+) {
+            fn check(&self) -> Result<(), String> {
+                $( self.$i.check()?; )+
+                Ok(())
+            }
+            fn refs(&self, visit: &mut dyn FnMut(u64)) {
+                $( self.$i.refs(visit); )+
+            }
+        }
+    )* };
+}
+impl_value_tuple! {
+    (A 0)
+    (A 0, B 1)
+    (A 0, B 1, C 2)
+    (A 0, B 1, C 2, D 3)
+    (A 0, B 1, C 2, D 3, E 4)
+    (A 0, B 1, C 2, D 3, E 4, F 5)
+}
+
+// serde only implements arrays of up to 32 elements, hence the bound.
+impl<T: Value, const N: usize> Value for [T; N]
+where
+    [T; N]: Serialize + DeserializeOwned,
+{
+    fn check(&self) -> Result<(), String> {
+        self.iter().try_for_each(T::check)
+    }
+    fn refs(&self, visit: &mut dyn FnMut(u64)) {
+        self.iter().for_each(|value| value.refs(visit))
+    }
+}
+
 impl<E: Entity> Value for Id<E> {
     fn refs(&self, visit: &mut dyn FnMut(u64)) {
         visit(self.raw())

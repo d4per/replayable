@@ -31,6 +31,9 @@ pub struct LogFile {
     /// The length of the file: the end of the last whole event.
     len: u64,
     truncated: u64,
+    /// The store it was opened with, and how many of its events are in the
+    /// file.
+    mark: (u64, usize),
 }
 
 impl LogFile {
@@ -46,7 +49,7 @@ impl LogFile {
         let mut file = OpenOptions::new().read(true).write(true).create(true).truncate(false).open(path)?;
         let size = file.metadata()?.len();
         let (store, end) = Store::load_binary(Input::Stream(&mut file), false, true)?;
-        let mut log = LogFile { file, len: end.complete, truncated: 0 };
+        let mut log = LogFile { file, len: end.complete, truncated: 0, mark: store.storage_mark() };
         if end.cut_off {
             log.truncated = size - end.complete;
             log.file.set_len(end.complete)?;
@@ -61,9 +64,22 @@ impl LogFile {
     ///
     /// If writing fails, the file is cut back to its length before, and the
     /// store keeps the events, so `append` can be called again.
+    ///
+    /// Fails without writing anything if `store` isn't the one returned by
+    /// [`open`](LogFile::open), or if some of its events were saved,
+    /// flushed or forgotten without this file since the last append, since
+    /// the file would then miss them.
     pub fn append<M: Model>(&mut self, store: &mut Store<M>) -> io::Result<()> {
+        if store.storage_mark() != self.mark {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "this isn't the store the log file was opened with, or some of its events were saved, \
+                 flushed or forgotten elsewhere since the last append, so the file would miss them",
+            ));
+        }
         match store.flush_binary(&mut self.file) {
             Ok(()) => {
+                self.mark = store.storage_mark();
                 self.len = self.file.stream_position()?;
                 Ok(())
             }

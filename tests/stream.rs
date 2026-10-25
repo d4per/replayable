@@ -341,6 +341,26 @@ fn a_log_file_cut_off_in_an_event_loses_only_that_event() {
 }
 
 #[test]
+fn a_log_file_only_appends_for_its_own_store() {
+    let path = temp("guard");
+    let (mut file, mut store) = LogFile::open::<World>(&path).unwrap();
+    step(&mut store, 0);
+    file.append(&mut store).unwrap();
+    let len = file.len();
+
+    // Another store.
+    let mut other = self::store();
+    step(&mut other, 1);
+    assert_eq!(file.append(&mut other).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    // Events that went somewhere else, or nowhere.
+    step(&mut store, 1);
+    store.flush_binary(&mut Vec::new()).unwrap();
+    assert_eq!(file.append(&mut store).unwrap_err().kind(), io::ErrorKind::InvalidInput);
+    assert_eq!((file.len(), std::fs::metadata(&path).unwrap().len()), (len, len));
+    std::fs::remove_file(&path).unwrap();
+}
+
+#[test]
 fn a_log_file_that_is_corrupt_is_an_error() {
     let path = temp("corrupt");
     let mut store = store();

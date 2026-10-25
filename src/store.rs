@@ -1,6 +1,6 @@
 use crate::binary;
 use crate::codec::{self, Parsed};
-use crate::{Error, Id, Timestamp};
+use crate::{Error, Id, Position, Timestamp};
 use serde::de::MapAccess;
 use serde::ser::{SerializeMap, Serializer};
 use serde::{de::DeserializeOwned, Serialize};
@@ -9,6 +9,7 @@ use std::fmt;
 use std::io::{BufRead, Read, Write};
 use std::ops::{Deref, DerefMut, Index};
 use std::panic::{self, AssertUnwindSafe};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// An entity type declared in [`model!`](crate::model). Implemented by the
@@ -76,6 +77,11 @@ pub trait Model: Default {
     fn pins_mut(&mut self) -> &mut BTreeSet<u64>;
     /// Whether there are no entities at all.
     fn is_empty(&self) -> bool;
+    /// Whether an entity with the raw id `raw` exists, of any type.
+    fn exists(&self, raw: u64) -> bool;
+    /// Describes the first reference, weak or not, to an entity that
+    /// doesn't exist, if any.
+    fn first_dangling(&self) -> Option<String>;
     /// Visits what the entity with the raw id `raw` keeps alive, see
     /// [`Entity::refs`]. Returns `false` if there's no such entity.
     fn refs_of(&self, raw: u64, visit: &mut dyn FnMut(u64)) -> bool;
@@ -210,8 +216,9 @@ impl<M: Model> Log<M> {
 /// Entities aren't deleted by hand. [`pin`](Store::pin) the ones that should
 /// stay, and [`collect`](Store::collect) deletes every entity that no pinned
 /// one refers to, directly or through others. A reference held by an entity
-/// therefore never dangles. An id kept outside the store can still outlive
-/// its entity.
+/// therefore doesn't dangle. An id kept outside the store can still outlive
+/// its entity, and nothing stops you from putting such an id back into an
+/// entity; [`verify`](Store::verify) reports a reference like that.
 ///
 /// Every event is logged with the time it happened, a [`Timestamp`] to the
 /// millisecond. See [`timestamps`](Store::timestamps) and
@@ -257,6 +264,9 @@ pub struct Store<M: Model> {
     /// What's needed to append to the binary log in storage: the one the
     /// store was read from, or saves to.
     storage: binary::WriteState,
+    /// A number no other store has, so that a `LogFile` can tell that it's
+    /// given the store it was opened with.
+    instance: u64,
 }
 
 impl<M: Model> Default for Store<M> {
@@ -276,7 +286,15 @@ impl<M: Model> Store<M> {
             last: None,
             clock: Arc::new(Timestamp::now),
         };
-        Store { state: M::default(), log, next_id: 1, editing: None, storage: binary::WriteState::default() }
+        static NEXT: AtomicU64 = AtomicU64::new(0);
+        let instance = NEXT.fetch_add(1, Ordering::Relaxed);
+        Store { state: M::default(), log, next_id: 1, editing: None, storage: binary::WriteState::default(), instance }
+    }
+
+    /// The store's own number, and how many of its events are in storage.
+    /// Used by `LogFile` to check that nothing else saved them.
+    pub(crate) fn storage_mark(&self) -> (u64, usize) {
+        (self.instance, self.log.saved)
     }
 
     /// Uses `clock` instead of the system clock for the times of new events.
@@ -422,7 +440,7 @@ impl<M: Model> Store<M> {
     where
         M: Contains<E>,
     {
-        if !self.state.pins().contains(&id.raw()) {
+        if !self.is_pinned(id) {
             return false;
         }
         self.log.push_live(M::unpinned(id));
@@ -435,7 +453,8 @@ impl<M: Model> Store<M> {
     where
         M: Contains<E>,
     {
-        self.state.pins().contains(&id.raw())
+        // Pins are raw ids, so the type is checked separately.
+        self.contains(id) && self.state.pins().contains(&id.raw())
     }
 
     /// Deletes every entity that can't be reached from a pinned one, and
@@ -632,10 +651,10 @@ impl<M: Model> Store<M> {
         if let Some(last) = self.log.last {
             if at < last {
                 let reason = format!("its time {at} is before {last}, the time of the event before it");
-                return Err(Error::InvalidEvent { index, reason });
+                return Err(Error::InvalidEvent { index, at: None, reason });
             }
         }
-        self.state.apply(event).map_err(|reason| Error::InvalidEvent { index, reason })?;
+        self.state.apply(event).map_err(|reason| Error::InvalidEvent { index, at: None, reason })?;
         self.next_id = self.next_id.max(M::entity_id(event).saturating_add(1));
         Ok(())
     }
@@ -751,7 +770,8 @@ impl<M: Model> Store<M> {
     }
 
     /// Replays a JSON Lines log, as written by [`write_json`](Store::write_json).
-    /// Blank lines are skipped.
+    /// Blank lines are skipped. A last line that was cut off, as in a crash
+    /// while it was written, is an [`Error::Json`] like any other bad line.
     ///
     /// The log may have been written by an older version of the model.
     /// Fields that didn't exist then get their default, old names declared
@@ -816,14 +836,26 @@ impl<M: Model> Store<M> {
         let mut de = serde_json::Deserializer::from_str(line);
         let (at, parsed) = codec::parse_line::<M, _>(&mut de).map_err(json_error)?;
         de.end().map_err(json_error)?;
-        self.apply_parsed(at, parsed, keep)
+        self.apply_parsed(Position::Line(number), at, parsed, keep)
     }
 
-    /// Applies an event read from storage, keeping it in memory or not.
-    fn apply_parsed(&mut self, at: Timestamp, parsed: Parsed<M::Event>, keep: bool) -> Result<(), Error> {
+    /// Applies an event read from storage at `position`, keeping it in
+    /// memory or not.
+    fn apply_parsed(
+        &mut self,
+        position: Position,
+        at: Timestamp,
+        parsed: Parsed<M::Event>,
+        keep: bool,
+    ) -> Result<(), Error> {
         match parsed {
             Parsed::Event(event) => {
-                self.apply_to_state(at, &event)?;
+                self.apply_to_state(at, &event).map_err(|e| match e {
+                    Error::InvalidEvent { index, reason, .. } => {
+                        Error::InvalidEvent { index, at: Some(position), reason }
+                    }
+                    other => other,
+                })?;
                 if keep {
                     self.log.push(at, event);
                 } else {
@@ -1008,7 +1040,9 @@ impl<M: Model> Store<M> {
         allow_cut_off: bool,
     ) -> Result<(Self, binary::ReadEnd), Error> {
         let mut store = Self::new();
-        let mut end = binary::read::<M>(input, allow_cut_off, |at, parsed| store.apply_parsed(at, parsed, keep))?;
+        let mut end = binary::read::<M>(input, allow_cut_off, |offset, at, parsed| {
+            store.apply_parsed(Position::Offset(offset), at, parsed, keep)
+        })?;
         store.log.saved = store.log.len();
         if end.complete > 0 {
             end.state.upto = Some(store.log.len());
@@ -1024,7 +1058,15 @@ impl<M: Model> Store<M> {
     /// Meant for tests. A difference means something changed without being
     /// logged, for example through a `Cell` inside a value, or that a value
     /// type doesn't survive a trip through JSON.
+    ///
+    /// It also checks that every reference, weak or not, points to an
+    /// entity that exists. One that doesn't was put there with an id that
+    /// had gone stale (kept from before a [`collect`](Store::collect)) or
+    /// that was made up with [`Id::from_raw`].
     pub fn verify(&self) -> Result<(), String> {
+        if let Some(dangling) = self.state.first_dangling() {
+            return Err(dangling);
+        }
         if self.log.base > 0 {
             return Err(format!(
                 "the first {} events were forgotten, so the log can't be replayed from memory; replay it from storage",

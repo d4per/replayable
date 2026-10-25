@@ -253,6 +253,39 @@ fn bad_pins_in_a_log_are_errors() {
     }
 }
 
+#[test]
+fn verify_finds_references_to_entities_that_dont_exist() {
+    let mut store = Store::<Files>::new();
+    let root = folder(&mut store, "root");
+    store.pin(root);
+    let old = folder(&mut store, "old");
+    assert_eq!(store.collect(), 1);
+    assert_eq!(store.verify(), Ok(()));
+    // An id kept from before the collect.
+    store.edit(root).children.push(old);
+    assert_eq!(store.verify(), Err("Folder id:1 refers to id 2, which doesn't exist".into()));
+    store.edit(root).children.clear();
+    let i = item(&mut store, "i");
+    store.edit(root).items.push(i);
+    store.edit(i).seen.push(old);
+    assert_eq!(store.verify(), Err("Item id:3 has a weak reference to an entity that doesn't exist".into()));
+}
+
+#[test]
+fn ids_are_unique_across_types_in_a_log() {
+    let log = concat!(
+        r#"{"at":"2026-10-24T09:15:02.123Z","CreateFolder":[1,{}]}"#,
+        "\n",
+        r#"{"at":"2026-10-24T09:15:02.123Z","CreateItem":[1,{}]}"#,
+    );
+    match Store::<Files>::from_json(log) {
+        Err(Error::InvalidEvent { index: 1, reason, .. }) => {
+            assert_eq!(reason, "Item id:1 can't be created, since an entity of another type has the id 1")
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
 /// A log written when entities were deleted by hand still loads, and a
 /// deleted entity is no longer pinned.
 #[test]

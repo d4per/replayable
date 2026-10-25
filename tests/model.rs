@@ -1,7 +1,7 @@
 //! Tests through the public API, from outside the crate, so they also check
 //! that `model!` works when used from another crate.
 
-use replayable::{model, Error, Id, List, ListOp, Map, Store, Timestamp, Value};
+use replayable::{model, Error, Id, List, ListOp, Map, Position, Store, Timestamp, Value};
 use serde::{Deserialize, Serialize};
 use std::panic::{self, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -508,8 +508,23 @@ fn corrupt_logs_give_errors() {
     // An update before the create.
     let bad = lines[1..].join("\n");
     let err = Store::<World>::from_json(&bad).unwrap_err();
-    assert!(matches!(err, Error::InvalidEvent { index: 0, .. }), "{err}");
-    assert_eq!(err.to_string(), "event 0 can't be applied: User id:1 doesn't exist");
+    assert!(matches!(err, Error::InvalidEvent { index: 0, at: Some(Position::Line(1)), .. }), "{err}");
+    assert_eq!(err.to_string(), "event 0, at line 1, can't be applied: User id:1 doesn't exist");
+
+    // Blank lines count as lines, but not as events.
+    let bad = format!("{}\n\n{}", lines[0], lines[0]);
+    let err = Store::<World>::from_json(&bad).unwrap_err();
+    assert!(matches!(err, Error::InvalidEvent { index: 1, at: Some(Position::Line(3)), .. }), "{err}");
+
+    // In the binary format, the byte offset of the event.
+    let mut twice = Store::<World>::new();
+    twice.apply_event(store.events()[0].clone()).unwrap();
+    let mut bytes = twice.to_binary().unwrap();
+    bytes.push(0); // a reset, so that the event can be copied after it, header left out
+    let at = bytes.len() as u64;
+    bytes.extend_from_slice(&twice.to_binary().unwrap()[5..]);
+    let err = Store::<World>::from_binary(&bytes).unwrap_err();
+    assert!(matches!(err, Error::InvalidEvent { index: 1, at: Some(Position::Offset(o)), .. } if o == at), "{err}");
 
     // A create twice.
     let bad = format!("{}\n{}", lines[0], lines[0]);
@@ -521,7 +536,7 @@ fn corrupt_logs_give_errors() {
     let err = Store::<World>::from_json(&bad).unwrap_err();
     assert_eq!(
         err.to_string(),
-        "event 1 can't be applied: User id:1 tags: index 5 is out of range for a list of length 1"
+        "event 1, at line 2, can't be applied: User id:1 tags: index 5 is out of range for a list of length 1"
     );
 
     // Removing a key that isn't there.
@@ -645,6 +660,31 @@ fn a_rejected_value_in_update_keeps_the_entity() {
     let result = panic::catch_unwind(AssertUnwindSafe(|| store.update(p, |p, _| p.x = f64::NAN)));
     assert!(result.is_err());
     assert_eq!(store[p].x, 0.0);
+    assert_eq!(store.verify(), Ok(()));
+}
+
+#[test]
+fn tuples_and_arrays_are_values() {
+    replayable::model! { Shapes { Shape { at: (f64, f64), corners: List<[u8; 2]>, by: Map<(u8, u8), String> } } }
+    let mut store = Store::<Shapes>::new();
+    let s = store.create(Shape { at: (1.0, -2.5), ..Default::default() });
+    store.edit(s).corners.push([1, 2]);
+    store.edit(s).by.insert((0, 1), "a".into());
+    assert_eq!(store.verify(), Ok(()));
+    let result = panic::catch_unwind(AssertUnwindSafe(|| store.edit(s).at.1 = f64::NAN));
+    assert!(result.is_err());
+    assert_eq!(store[s].at, (1.0, -2.5));
+}
+
+#[test]
+fn pins_are_checked_against_the_type() {
+    let mut store = Store::<World>::new();
+    let u = store.create(User::default());
+    store.pin(u);
+    let as_group = Id::<Group>::from_raw(u.raw());
+    assert!(!store.is_pinned(as_group));
+    assert!(!store.unpin(as_group));
+    assert!(store.is_pinned(u));
     assert_eq!(store.verify(), Ok(()));
 }
 

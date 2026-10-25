@@ -112,10 +112,13 @@ one variant per field, and a `<Model>Event` enum with
   number, and the new contents are logged.
 - **Deleting** isn't done by hand. You pin the entities that should stay,
   and `collect` deletes everything they can't reach, logging a delete for
-  each. So a reference held by an entity never dangles.
+  each. So a reference held by an entity doesn't dangle, as long as you
+  don't put a stale id into one (see below).
 - **Replay** applies events one by one to an empty model. It checks that
-  every event fits, and returns an [`Error`] instead of panicking on a corrupt
-  log.
+  every event fits (the entity exists, a list index is in range ...), and
+  returns an [`Error`] instead of panicking on a corrupt log. It doesn't
+  check that references point to entities that exist; [`Store::verify`]
+  does.
 
 Edits go through [`Store::edit`], which returns a guard that derefs to
 `&mut Entity` and turns the changes into events when it's dropped. Use
@@ -135,16 +138,21 @@ Edits go through [`Store::edit`], which returns a guard that derefs to
 | `roles: Map<User, Role>` | [`Map<Id<User>, Role>`][Map] |
 | `reply_to: Weak<Message>` | `Option<Id<Message>>` (a [weak reference](#deleting-pins-and-collect)) |
 | `seen_by: List<Weak<User>>` | `List<Id<User>>` |
+| `at: (f64, f64)`, `rgb: [u8; 3]` | the same type (tuples of up to six values, arrays of up to 32) |
 
 Entities can refer to themselves, so `parent: User` and `friends: List<User>`
 inside `User` both work, and so do cycles of any length, like a `Topic`
 with `messages: List<Message>` whose messages have `topic: Topic`. A
 reference is stored as an id, never as a copy, so nothing follows it by
 itself. A reference to an entity is always optional,
-because a new entity starts out from `Default`.
+because a new entity starts out from `Default`. So write `parent: User`,
+not `parent: Option<User>`, which doesn't compile (with an error that
+`User` isn't a `Value`).
 
-Use `List` and `Map` instead of `Vec` and `BTreeMap`. They have the same API,
-but changes made directly to a plain `Vec` can't be seen.
+Use `List` and `Map` instead of `Vec` and `BTreeMap`, which can't be fields.
+They have the same API, but log each change, where a `Vec` would have to be
+logged whole every time it changed. If that's what you want, put the `Vec`
+inside your own value type.
 
 ### Your own value types
 
@@ -230,13 +238,17 @@ assert_eq!(log[log.len() - 3..], [
 - **Ids kept outside the store can still go stale.** An `Id` in a local
   variable, a `HashMap` or a URL isn't seen by `collect`. After a collect,
   `store.get(id)` returns `None` and `store[id]` panics. Ids are never
-  reused, so a stale id never finds another entity.
+  reused, so a stale id never finds another entity. But nothing stops you
+  from putting a stale id into an entity, like `members.push(old)`, and
+  then that reference dangles. [`Store::verify`] reports it, so call it in
+  your tests; check with `store.contains(id)` first where an id may be old.
 - **Ids inside your own value types** are only seen if the type overrides
   [`Value::refs`]. Without that, the entity they point to can be deleted
   while still in use.
 - **`collect` panics if nothing is pinned** but there are entities, since
   it would delete them all. A log written before pins existed needs its
-  roots pinned first; see [Changing the model](#changing-the-model).
+  roots pinned first; see [Changing the model](#changing-the-model). To
+  get rid of everything, start a new log instead.
 - **Replay doesn't run `collect`.** The deletes it logged are replayed
   like any other event. [`Store::unpin`] lets an entity go again, and
   [`Store::is_pinned`] tells whether it's pinned.
@@ -342,7 +354,12 @@ a log that grows for years, only the state needs to be in memory:
 - [`LogFile`] does both for a binary log in a file. If the device lost
   power while an event was being written, [`LogFile::open`] cuts off that
   half-written event instead of failing. If an append fails, the file is
-  cut back to where it was.
+  cut back to where it was. An append refuses to write if the store's
+  events were saved, flushed or forgotten without it since the last one,
+  since the file would miss them.
+- There's no `LogFile` for JSON. A JSON log whose last line was cut off in
+  a crash fails to load with an [`Error::Json`] for that line; remove the
+  line to load the rest.
 
 ```rust,no_run
 # use replayable::{model, LogFile};
@@ -486,6 +503,7 @@ later:
 | `usize`/`isize` fields, read on a platform with a different width | Loading fails if a value doesn't fit. Prefer fixed-width integers. |
 | An `Ord` on a map key type that disagrees with its `PartialEq` | Nothing. Keep them consistent, as `BTreeMap` requires anyway. |
 | An `Id` inside your own value type, without overriding [`Value::refs`] | Nothing. `collect` doesn't see the id, and can delete what it points to while it's still in use. |
+| A stale id (kept from before a `collect`, or made with [`Id::from_raw`]) put into an entity | [`Store::verify`] reports the reference to an entity that doesn't exist. |
 
 ## What things cost
 
@@ -522,8 +540,14 @@ replay about 60 ns per event (230 ns from JSON), and `collect` about
 - **`update` can't create or edit other entities.** Its closure only gets
   `&Store`. Make those changes before or after.
 - **Only `collect` deletes**, and only what no pinned entity can reach, so
-  the references entities hold never dangle. Ids you keep outside the
-  store can; see [Deleting](#deleting-pins-and-collect).
+  the references entities hold don't dangle. Ids you keep outside the
+  store can, and so does a reference made from one; see
+  [Deleting](#deleting-pins-and-collect).
+- **There are no transactions.** Each change is its own event, so an
+  operation that makes several changes is saved as several events. If the
+  program stops while they're being written, the log can end with only
+  the first of them. Save at the end of each operation, and keep the
+  operations small enough that a part of one still makes sense.
 - **Ids are unique across all entity types** in a store and are never
   reused. Use [`Id::from_raw`] to rebuild one from a number; it isn't
   checked.

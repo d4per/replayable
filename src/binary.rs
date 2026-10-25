@@ -575,7 +575,7 @@ pub(crate) struct ReadEnd {
     pub(crate) cut_off: bool,
 }
 
-/// Reads a binary log, calling `apply` for every event.
+/// Reads a binary log, calling `apply` for every event, with its offset.
 ///
 /// A stream is read a chunk at a time, and each chunk is parsed in place.
 /// An event that's only partly in the buffer is parsed again once more has
@@ -584,7 +584,7 @@ pub(crate) struct ReadEnd {
 pub(crate) fn read<M: Model>(
     input: Input<'_>,
     allow_cut_off: bool,
-    apply: impl FnMut(Timestamp, Parsed<M::Event>) -> std::result::Result<(), Error>,
+    apply: impl FnMut(u64, Timestamp, Parsed<M::Event>) -> std::result::Result<(), Error>,
 ) -> std::result::Result<ReadEnd, Error> {
     read_chunked::<M>(input, CHUNK, allow_cut_off, apply)
 }
@@ -594,7 +594,7 @@ fn read_chunked<M: Model>(
     input: Input<'_>,
     chunk: usize,
     allow_cut_off: bool,
-    mut apply: impl FnMut(Timestamp, Parsed<M::Event>) -> std::result::Result<(), Error>,
+    mut apply: impl FnMut(u64, Timestamp, Parsed<M::Event>) -> std::result::Result<(), Error>,
 ) -> std::result::Result<ReadEnd, Error> {
     let bad = |offset, reason: String| Error::Binary { offset, reason };
     let (bytes, mut stream, mut eof) = match input {
@@ -641,7 +641,7 @@ fn read_chunked<M: Model>(
             let (start, defined) = (r.pos, r.new.len());
             r.ran_out = false;
             match record::<M>(&mut r, &mut last) {
-                Ok(Some((at, parsed))) => apply(at, parsed)?,
+                Ok(Some((at, parsed))) => apply(offset + start as u64, at, parsed)?,
                 Ok(None) => {}
                 Err(e) => {
                     // Parse it again once there's more, or stop before it.
@@ -1343,7 +1343,7 @@ mod tests {
         let bytes = store.to_binary().unwrap();
         fn read(input: Input<'_>, chunk: usize) -> Vec<(Timestamp, WorldEvent)> {
             let mut events = Vec::new();
-            read_chunked::<World>(input, chunk, false, |at, parsed| {
+            read_chunked::<World>(input, chunk, false, |_, at, parsed| {
                 if let Parsed::Event(e) = parsed {
                     events.push((at, e));
                 }

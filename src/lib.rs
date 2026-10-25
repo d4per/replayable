@@ -14,7 +14,7 @@ mod map;
 mod store;
 mod time;
 
-pub use error::Error;
+pub use error::{Error, Position};
 pub use field::{Declared, Element, Field, Key, OpOf, Stored, Value, Weak};
 pub use file::LogFile;
 pub use id::Id;

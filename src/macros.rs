@@ -400,13 +400,17 @@ macro_rules! model {
             fn apply(&mut self, event: &Self::Event) -> ::core::result::Result<(), ::std::string::String> {
                 match event {
                     $(
-                        [<$model Event>]::[<Create $entity>](id, entity) => match self.$entity.entry(*id) {
-                            $crate::__private::btree_map::Entry::Vacant(slot) => {
-                                slot.insert(::core::clone::Clone::clone(&**entity));
+                        [<$model Event>]::[<Create $entity>](id, entity) => {
+                            if self.$entity.contains_key(id) {
+                                return ::core::result::Result::Err(::std::format!("{id:?} already exists"));
                             }
-                            $crate::__private::btree_map::Entry::Occupied(_) =>
-                                return ::core::result::Result::Err(::std::format!("{id:?} already exists")),
-                        },
+                            // Ids are unique across all entity types.
+                            if $crate::Model::exists(self, id.raw()) {
+                                return ::core::result::Result::Err(::std::format!(
+                                    "{id:?} can't be created, since an entity of another type has the id {}", id.raw()));
+                            }
+                            self.$entity.insert(*id, ::core::clone::Clone::clone(&**entity));
+                        }
                         [<$model Event>]::[<Update $entity>](id, change) => match self.$entity.get_mut(id) {
                             ::core::option::Option::Some(e) => $crate::Entity::apply(e, change)
                                 .map_err(|e| ::std::format!("{id:?} {e}"))?,
@@ -448,6 +452,34 @@ macro_rules! model {
 
             fn is_empty(&self) -> bool {
                 true $( && self.$entity.is_empty() )*
+            }
+
+            #[allow(unused_variables)]
+            fn exists(&self, raw: u64) -> bool {
+                false $( || self.$entity.contains_key(&$crate::Id::from_raw(raw)) )*
+            }
+
+            fn first_dangling(&self) -> ::core::option::Option<::std::string::String> {
+                let exists = |raw: u64| $crate::Model::exists(self, raw);
+                $(
+                    for (id, entity) in &self.$entity {
+                        let mut missing = ::core::option::Option::None;
+                        $crate::Entity::refs(entity, &mut |raw| {
+                            if missing.is_none() && !exists(raw) {
+                                missing = ::core::option::Option::Some(raw);
+                            }
+                        });
+                        if let ::core::option::Option::Some(raw) = missing {
+                            return ::core::option::Option::Some(::std::format!(
+                                "{id:?} refers to id {raw}, which doesn't exist"));
+                        }
+                        if $crate::Entity::has_dead_weak(entity, &exists) {
+                            return ::core::option::Option::Some(::std::format!(
+                                "{id:?} has a weak reference to an entity that doesn't exist"));
+                        }
+                    }
+                )*
+                ::core::option::Option::None
             }
 
             #[allow(unused_variables)]
