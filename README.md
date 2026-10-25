@@ -30,13 +30,13 @@ model! {
 let mut store = Store::<World>::new();
 
 // Create with a plain struct literal
-let sune = store.create(User { name: "Sune".into(), age: 14, ..Default::default() });
-let bertil = store.create(User { name: "Bertil".into(), age: 42, ..Default::default() });
+let sam = store.create(User { name: "Sam".into(), age: 14, ..Default::default() });
+let tom = store.create(User { name: "Tom".into(), age: 42, ..Default::default() });
 
 // Edit through a plain `&mut User`
-store.edit(sune).parent = Some(bertil);
+store.edit(sam).parent = Some(tom);
 {
-    let mut u = store.edit(sune);
+    let mut u = store.edit(sam);
     u.age += 1;
     u.tags.push("chess".into());
     u.tags.push("football".into());
@@ -44,12 +44,12 @@ store.edit(sune).parent = Some(bertil);
 
 // Read other entities while editing
 let club = store.create(Group { title: "The Club".into(), ..Default::default() });
-store.edit(club).members.extend([sune, bertil]);
+store.edit(club).members.extend([sam, tom]);
 store.update(club, |g, store| g.members.retain(|&m| store[m].age >= 18));
-store.edit(club).roles.insert(bertil, "chair".into());
+store.edit(club).roles.insert(tom, "chair".into());
 
 // Read: store[id] gives a plain &User
-assert_eq!(store[store[sune].parent.unwrap()].name, "Bertil");
+assert_eq!(store[store[sam].parent.unwrap()].name, "Tom");
 
 // Every change is in the log
 let log: Vec<String> = store.events().iter().map(|e| e.to_string()).collect();
@@ -65,7 +65,7 @@ assert_eq!(log[2..], [
 
 // Save and load again
 let loaded = Store::<World>::from_json(&store.to_json().unwrap()).unwrap();
-assert_eq!(loaded[sune], store[sune]);
+assert_eq!(loaded[sam], store[sam]);
 assert_eq!(loaded[club], store[club]);
 ```
 
@@ -247,7 +247,7 @@ The log is written as [JSON Lines](https://jsonlines.org/), one event per
 line, each with the time it was logged:
 
 ```text
-{"at":"2026-10-24T09:15:02.123Z","CreateUser":[1,{"name":"Sune","age":14,"parent":null,"tags":[]}]}
+{"at":"2026-10-24T09:15:02.123Z","CreateUser":[1,{"name":"Sam","age":14,"parent":null,"tags":[]}]}
 {"at":"2026-10-24T09:15:02.123Z","PinUser":1}
 {"at":"2026-10-24T09:15:02.123Z","UpdateUser":[1,{"age":15}]}
 {"at":"2026-10-24T09:20:41.007Z","UpdateUser":[1,{"tags":{"Splice":{"at":0,"remove":0,"insert":["chess","football"]}}}]}
@@ -340,7 +340,7 @@ a log that grows for years, only the state needs to be in memory:
 # use replayable::{model, LogFile};
 # model! { pub World { User { name: String } } }
 let (mut file, mut store) = LogFile::open::<World>("world.rplb")?;
-let u = store.create(User { name: "Sune".into() });
+let u = store.create(User { name: "Sam".into() });
 store.pin(u);
 file.append(&mut store)?; // the events are written, and no longer in memory
 file.sync()?;             // and now they are on the disk
