@@ -269,13 +269,13 @@ use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter};
 
 let mut store = Store::<World>::read_json(BufReader::new(File::open("log.jsonl")?))?;
-let mut saved = store.events().len();
+let mut saved = store.event_count();
 
 // ... make changes ...
 
 let file = OpenOptions::new().append(true).open("log.jsonl")?;
 store.write_json_since(saved, BufWriter::new(file))?;
-saved = store.events().len();
+saved = store.event_count();
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
 
@@ -317,6 +317,58 @@ file. The store remembers the names the file defines, from writing or
 reading it, so they aren't written again. JSON is easier to read and edit
 by hand, and to process with other tools; the binary format needs this
 crate (or its [layout](#binary-layout)).
+
+### Keeping only the state in memory
+
+By default the whole log stays in memory, which is what makes
+[`Store::as_of`] and [`Store::verify`] possible. On a small device, or for
+a log that grows for years, only the state needs to be in memory:
+
+- [`Store::resume_binary`] and [`Store::resume_json`] replay a log as it is
+  read, without keeping its events. Reading is done a chunk at a time, so
+  memory use depends on the size of the state, not of the log.
+- [`Store::flush_binary`] and [`Store::flush_json`] append the events that
+  aren't in storage yet, then forget them. Errors are returned from the
+  flush, so `create` and `edit` still can't fail. Call it at the end of
+  each operation, or every so often.
+- [`LogFile`] does both for a binary log in a file. If the device lost
+  power while an event was being written, [`LogFile::open`] cuts off that
+  half-written event instead of failing. If an append fails, the file is
+  cut back to where it was.
+
+```rust,no_run
+# use replayable::{model, LogFile};
+# model! { pub World { User { name: String } } }
+let (mut file, mut store) = LogFile::open::<World>("world.rplb")?;
+let u = store.create(User { name: "Sune".into() });
+store.pin(u);
+file.append(&mut store)?; // the events are written, and no longer in memory
+file.sync()?;             // and now they are on the disk
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+To store the log somewhere else, give the `flush_*` and `resume_*` methods
+your own [`std::io::Write`] and [`std::io::Read`] (a flash partition, a
+socket...), or handle the events yourself with [`Store::flush_with`]:
+
+```rust
+# use replayable::{model, Store};
+# model! { pub World { User { name: String } } }
+# let mut store = Store::<World>::new();
+# store.create(User { name: "a".into() });
+store.flush_with(|at, event| {
+    println!("{at} {event}"); // or send it, or store it in a database
+    Ok::<(), std::io::Error>(())
+})?;
+assert!(store.events().is_empty());
+# Ok::<(), std::io::Error>(())
+```
+
+Once events are forgotten, [`Store::events`] only holds the newer ones,
+[`Store::event_count`] still counts them all, and the methods that need the
+whole log ([`Store::as_of`], [`Store::to_json`], [`Store::to_binary`] and
+so on) panic. [`Store::verify`] returns an error. To look back in time, read
+the log from storage with `read_*`.
 
 ### Going back in time
 
@@ -467,9 +519,10 @@ replay about 60 ns per event (230 ns from JSON), and `collect` about
 - **Ids are unique across all entity types** in a store and are never
   reused. Use [`Id::from_raw`] to rebuild one from a number; it isn't
   checked.
-- **The whole log stays in memory**, and loading replays it from the start.
-  [`Store::read_binary`] reads the whole file into memory before replaying.
-  There are no snapshots or compaction yet.
+- **The whole log stays in memory** unless you flush it out, see
+  [Keeping only the state in memory](#keeping-only-the-state-in-memory).
+  Loading replays the log from the start. There are no snapshots or
+  compaction yet.
 - **Don't `mem::forget` an `Edit`.** The changes stay in the entity but are
   never logged, so a replay won't match.
 - **Times come from the system clock** and never go backwards in the log:
@@ -574,4 +627,15 @@ conditions.
 [`Store::apply_event_at`]: https://docs.rs/replayable/latest/replayable/struct.Store.html#method.apply_event_at
 [`Store::timestamps`]: https://docs.rs/replayable/latest/replayable/struct.Store.html#method.timestamps
 [`Store::with_clock`]: https://docs.rs/replayable/latest/replayable/struct.Store.html#method.with_clock
+[`Store::resume_binary`]: https://docs.rs/replayable/latest/replayable/struct.Store.html#method.resume_binary
+[`Store::resume_json`]: https://docs.rs/replayable/latest/replayable/struct.Store.html#method.resume_json
+[`Store::flush_binary`]: https://docs.rs/replayable/latest/replayable/struct.Store.html#method.flush_binary
+[`Store::flush_json`]: https://docs.rs/replayable/latest/replayable/struct.Store.html#method.flush_json
+[`Store::flush_with`]: https://docs.rs/replayable/latest/replayable/struct.Store.html#method.flush_with
+[`Store::event_count`]: https://docs.rs/replayable/latest/replayable/struct.Store.html#method.event_count
+[`Store::to_json`]: https://docs.rs/replayable/latest/replayable/struct.Store.html#method.to_json
+[`LogFile`]: https://docs.rs/replayable/latest/replayable/struct.LogFile.html
+[`LogFile::open`]: https://docs.rs/replayable/latest/replayable/struct.LogFile.html#method.open
+[`std::io::Write`]: https://doc.rust-lang.org/std/io/trait.Write.html
+[`std::io::Read`]: https://doc.rust-lang.org/std/io/trait.Read.html
 [`Timestamp`]: https://docs.rs/replayable/latest/replayable/struct.Timestamp.html

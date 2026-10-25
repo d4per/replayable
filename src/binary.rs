@@ -136,7 +136,9 @@ pub(crate) struct WriteState {
     names: Names,
     last: Timestamp,
     /// How many of the store's events the file holds. `None` if unknown.
-    upto: Option<usize>,
+    pub(crate) upto: Option<usize>,
+    /// Whether the file starts with the header.
+    pub(crate) has_header: bool,
 }
 
 impl WriteState {
@@ -146,23 +148,23 @@ impl WriteState {
     }
 }
 
-/// Writes the events after the first `n`, for a file that holds the first
-/// `n`. With `n == 0` it's a new file, which gets the header. If `state`
-/// isn't about a file with `n` events, a reset record comes first, so the
-/// result is right either way.
+/// Writes `events`, which follow the first `n` events of the log, for a file
+/// that holds those `n`. With `header`, it's a new file, which gets the
+/// header first. Otherwise, if `state` isn't about a file with `n` events, a
+/// reset record comes first, so the result is right either way.
 pub(crate) fn write<M: Model>(
     state: &mut WriteState,
     n: usize,
+    header: bool,
     times: &[Timestamp],
     events: &[M::Event],
     mut writer: impl io::Write,
 ) -> io::Result<()> {
-    let (times, events) = (&times[n..], &events[n..]);
     if times.is_empty() {
         return Ok(());
     }
     let mut out = Vec::with_capacity(times.len().min(1 << 12) * 32);
-    if n == 0 {
+    if header {
         out.extend_from_slice(HEADER);
         state.reset();
     } else if state.upto != Some(n) {
@@ -188,6 +190,7 @@ pub(crate) fn write<M: Model>(
     }
     writer.write_all(&out)?;
     state.upto = Some(n + times.len());
+    state.has_header = true;
     Ok(())
 }
 
@@ -550,66 +553,192 @@ impl ser::SerializeStructVariant for Compound<'_, '_> {
 // ---------------------------------------------------------------------------
 // Reading
 
-/// Reads a whole binary log, calling `apply` for every event, and returns
-/// what's needed to append to it.
+/// Where a binary log is read from.
+pub(crate) enum Input<'a> {
+    /// All of it, in memory.
+    Bytes(&'a [u8]),
+    /// A stream, read in chunks.
+    Stream(&'a mut dyn io::Read),
+}
+
+/// How much of a stream is read at a time. The buffer grows if one event is
+/// larger than this.
+const CHUNK: usize = 16 << 10;
+
+/// How reading a binary log ended.
+pub(crate) struct ReadEnd {
+    /// What's needed to append to the log. `upto` is left for the caller.
+    pub(crate) state: WriteState,
+    /// The offset just after the last whole record (or the header).
+    pub(crate) complete: u64,
+    /// Whether the log ends in the middle of a record or of the header.
+    pub(crate) cut_off: bool,
+}
+
+/// Reads a binary log, calling `apply` for every event.
+///
+/// A stream is read a chunk at a time, and each chunk is parsed in place.
+/// An event that's only partly in the buffer is parsed again once more has
+/// been read. With `allow_cut_off`, a log that ends in the middle of an
+/// event isn't an error: reading stops after the last whole one.
 pub(crate) fn read<M: Model>(
-    bytes: &[u8],
+    input: Input<'_>,
+    allow_cut_off: bool,
+    apply: impl FnMut(Timestamp, Parsed<M::Event>) -> std::result::Result<(), Error>,
+) -> std::result::Result<ReadEnd, Error> {
+    read_chunked::<M>(input, CHUNK, allow_cut_off, apply)
+}
+
+/// [`read`], with the size of a chunk given, for tests.
+fn read_chunked<M: Model>(
+    input: Input<'_>,
+    chunk: usize,
+    allow_cut_off: bool,
     mut apply: impl FnMut(Timestamp, Parsed<M::Event>) -> std::result::Result<(), Error>,
-) -> std::result::Result<WriteState, Error> {
-    let mut state = WriteState::default();
-    if bytes.is_empty() {
-        return Ok(state);
-    }
+) -> std::result::Result<ReadEnd, Error> {
     let bad = |offset, reason: String| Error::Binary { offset, reason };
-    if bytes.len() < HEADER.len() || bytes[..4] != HEADER[..4] {
+    let (bytes, mut stream, mut eof) = match input {
+        Input::Bytes(bytes) => (bytes, None, true),
+        Input::Stream(stream) => (&[][..], Some(stream), false),
+    };
+    let mut buf = Vec::new();
+    if let Some(stream) = &mut stream {
+        buf.reserve(chunk);
+        eof = fill(&mut buf, &mut **stream, HEADER.len())?;
+    }
+    let data = if stream.is_some() { &buf[..] } else { bytes };
+    let mut end = ReadEnd { state: WriteState::default(), complete: 0, cut_off: false };
+    if data.is_empty() {
+        return Ok(end);
+    }
+    if data.len() < HEADER.len() && allow_cut_off && HEADER.starts_with(data) {
+        end.cut_off = true;
+        return Ok(end);
+    }
+    if data.len() < HEADER.len() || data[..4] != HEADER[..4] {
         return Err(bad(0, "not a replayable binary log: it doesn't start with `RPLB`".into()));
     }
-    if bytes[4] != HEADER[4] {
+    if data[4] != HEADER[4] {
         return Err(bad(
             4,
-            format!("the log is in version {} of the binary format, but only version 1 can be read", bytes[4]),
+            format!("the log is in version {} of the binary format, but only version 1 can be read", data[4]),
         ));
     }
-    let mut r = Reader { input: bytes, pos: HEADER.len(), names: Vec::new(), depth: 0 };
+    // The names defined in earlier chunks, and where the buffer starts in
+    // the log.
+    let mut names: Vec<Box<str>> = Vec::new();
+    let mut offset = 0u64;
+    let mut pos = HEADER.len();
     let mut last = Timestamp::UNIX_EPOCH;
-    while r.pos < bytes.len() {
-        let start = r.pos;
-        let d = r.varint().map_err(|e| bad(start, *e.0))?;
-        if d == 0 {
-            r.names.clear();
-            last = Timestamp::UNIX_EPOCH;
-            continue;
+    loop {
+        let data = if stream.is_some() { &buf[..] } else { bytes };
+        let mut r = Reader::new(data, &names);
+        r.pos = pos;
+        let stopped = loop {
+            if r.pos == data.len() {
+                break None;
+            }
+            let (start, defined) = (r.pos, r.new.len());
+            r.ran_out = false;
+            match record::<M>(&mut r, &mut last) {
+                Ok(Some((at, parsed))) => apply(at, parsed)?,
+                Ok(None) => {}
+                Err(e) => {
+                    // Parse it again once there's more, or stop before it.
+                    r.pos = start;
+                    r.new.truncate(defined);
+                    if r.ran_out && (!eof || allow_cut_off) {
+                        break None;
+                    }
+                    break Some((start, e));
+                }
+            }
+        };
+        pos = r.pos;
+        let (new, cleared): (Vec<Box<str>>, _) = (r.new.iter().map(|&name| name.into()).collect(), r.cleared);
+        if cleared {
+            names.clear();
         }
-        let millis = last.unix_millis().saturating_add(d - 1);
-        if millis > MAX_MILLIS {
-            return Err(bad(start, "the time of the event is after year 9999".into()));
+        names.extend(new);
+        if let Some((start, e)) = stopped {
+            return Err(bad(offset + start as u64, *e.0));
         }
-        last = Timestamp::from_unix_millis(millis);
-        let parsed = codec::parse_event::<M, _>(&mut r).map_err(|e| bad(start, *e.0))?;
-        apply(last, parsed)?;
+        let stream = match &mut stream {
+            Some(stream) if !eof => stream,
+            _ => {
+                end.complete = offset + pos as u64;
+                end.cut_off = pos < data.len();
+                break;
+            }
+        };
+        // Keep the part of the buffer that hasn't been parsed, and read more.
+        buf.drain(..pos);
+        offset += pos as u64;
+        pos = 0;
+        if buf.len() == buf.capacity() {
+            buf.reserve(buf.len().max(chunk));
+        }
+        let want = buf.capacity();
+        eof = fill(&mut buf, &mut **stream, want)?;
     }
-    state.names = r.names.iter().enumerate().map(|(i, name)| ((*name).to_owned(), i as u32)).collect();
-    state.last = last;
-    Ok(state)
+    end.state.names = names.into_iter().enumerate().map(|(i, name)| (name.into(), i as u32)).collect();
+    end.state.last = last;
+    end.state.has_header = true;
+    Ok(end)
 }
 
-/// After reading a log of `bytes` that left the store with `events` events:
-/// the state for appending to it.
-pub(crate) fn appending(mut state: WriteState, bytes: &[u8], events: usize) -> WriteState {
-    if !bytes.is_empty() {
-        state.upto = Some(events);
+/// Reads one record: an event, or `None` for a reset.
+fn record<M: Model>(r: &mut Reader<'_>, last: &mut Timestamp) -> Result<Option<(Timestamp, Parsed<M::Event>)>> {
+    let d = r.varint()?;
+    if d == 0 {
+        r.reset();
+        *last = Timestamp::UNIX_EPOCH;
+        return Ok(None);
     }
-    state
+    let millis = last.unix_millis().saturating_add(d - 1);
+    if millis > MAX_MILLIS {
+        return Err(BinaryError::new("the time of the event is after year 9999"));
+    }
+    let parsed = codec::parse_event::<M, _>(&mut *r)?;
+    *last = Timestamp::from_unix_millis(millis);
+    Ok(Some((*last, parsed)))
 }
 
-/// A serde deserializer over a whole binary log, held in memory, so that
-/// names and strings can be borrowed from it.
+/// Reads from `stream` into the spare capacity of `buf`, until `buf` holds
+/// `want` bytes or the stream ends. Returns whether it ended.
+fn fill(buf: &mut Vec<u8>, stream: &mut dyn io::Read, want: usize) -> io::Result<bool> {
+    let mut len = buf.len();
+    buf.resize(buf.capacity().max(want), 0);
+    let result = loop {
+        if len >= want {
+            break Ok(false);
+        }
+        match stream.read(&mut buf[len..]) {
+            Ok(0) => break Ok(true),
+            Ok(n) => len += n,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+            Err(e) => break Err(e),
+        }
+    };
+    buf.truncate(len);
+    result
+}
+
+/// A serde deserializer over a binary log in memory, or the part of one in
+/// the buffer, so that names and strings can be borrowed from it.
 struct Reader<'de> {
     input: &'de [u8],
     pos: usize,
-    /// The names defined so far, in order.
-    names: Vec<&'de str>,
+    /// The names defined before `input`, in order.
+    old: &'de [Box<str>],
+    /// The names defined in `input`, in order, after `old`.
+    new: Vec<&'de str>,
+    /// Whether a reset record cleared `old`.
+    cleared: bool,
     depth: u32,
+    /// Set when the input ran out, so that the event can be read again once
+    /// there's more.
+    ran_out: bool,
 }
 
 fn cut_off() -> BinaryError {
@@ -617,18 +746,32 @@ fn cut_off() -> BinaryError {
 }
 
 impl<'de> Reader<'de> {
+    fn new(input: &'de [u8], old: &'de [Box<str>]) -> Self {
+        Reader { input, pos: 0, old, new: Vec::new(), cleared: false, depth: 0, ran_out: false }
+    }
+
+    fn short(&mut self) -> BinaryError {
+        self.ran_out = true;
+        cut_off()
+    }
+
     fn byte(&mut self) -> Result<u8> {
-        let b = *self.input.get(self.pos).ok_or_else(cut_off)?;
+        let b = self.peek()?;
         self.pos += 1;
         Ok(b)
     }
 
-    fn peek(&self) -> Result<u8> {
-        self.input.get(self.pos).copied().ok_or_else(cut_off)
+    fn peek(&mut self) -> Result<u8> {
+        match self.input.get(self.pos) {
+            Some(&b) => Ok(b),
+            None => Err(self.short()),
+        }
     }
 
     fn take(&mut self, n: usize) -> Result<&'de [u8]> {
-        let end = self.pos.checked_add(n).filter(|&end| end <= self.input.len()).ok_or_else(cut_off)?;
+        let Some(end) = self.pos.checked_add(n).filter(|&end| end <= self.input.len()) else {
+            return Err(self.short());
+        };
         let bytes = &self.input[self.pos..end];
         self.pos = end;
         Ok(bytes)
@@ -675,12 +818,23 @@ impl<'de> Reader<'de> {
     fn define(&mut self) -> Result<&'de str> {
         let n = self.len()?;
         let name = self.str(n)?;
-        self.names.push(name);
+        self.new.push(name);
         Ok(name)
     }
 
     fn name(&self, i: usize) -> Result<&'de str> {
-        self.names.get(i).copied().ok_or_else(|| BinaryError::new(format!("name #{i} is used before it's defined")))
+        let name = match i.checked_sub(self.old.len()) {
+            None => Some(&*self.old[i]),
+            Some(j) => self.new.get(j).copied(),
+        };
+        name.ok_or_else(|| BinaryError::new(format!("name #{i} is used before it's defined")))
+    }
+
+    /// A reset record: forgets all names.
+    fn reset(&mut self) {
+        self.old = &[];
+        self.new.clear();
+        self.cleared = true;
     }
 
     /// Reads a string in any of its forms, after its tag.
@@ -995,7 +1149,7 @@ mod tests {
     }
 
     fn decode<'de, T: Deserialize<'de>>(bytes: &'de [u8]) -> Result<T> {
-        let mut r = Reader { input: bytes, pos: 0, names: Vec::new(), depth: 0 };
+        let mut r = Reader::new(bytes, &[]);
         let value = T::deserialize(&mut r)?;
         assert_eq!(r.pos, bytes.len(), "all of the input is read");
         Ok(value)
@@ -1145,7 +1299,7 @@ mod tests {
         let bytes = encode(&mut Names::default(), &everything()).unwrap();
         for end in 0..bytes.len() {
             assert!(decode::<Everything>(&bytes[..end]).is_err(), "cut off at {end}");
-            let mut r = Reader { input: &bytes[..end], pos: 0, names: Vec::new(), depth: 0 };
+            let mut r = Reader::new(&bytes[..end], &[]);
             assert!(r.skip().is_err(), "skipping, cut off at {end}");
         }
         assert!(decode::<String>(&[NAME_SMALL + 3]).unwrap_err().0.contains("name #3 is used before"));
@@ -1164,10 +1318,46 @@ mod tests {
         let mut bytes = encode(&mut names, &Shape::Struct { name: "a".into(), sides: vec![] }).unwrap();
         bytes.extend(encode(&mut names, &Shape::Unit).unwrap());
         bytes.extend(encode(&mut names, &Shape::Struct { name: "b".into(), sides: vec![5] }).unwrap());
-        let mut r = Reader { input: &bytes, pos: 0, names: Vec::new(), depth: 0 };
+        let mut r = Reader::new(&bytes, &[]);
         r.skip().unwrap();
         assert_eq!(Shape::deserialize(&mut r).unwrap(), Shape::Unit);
         assert_eq!(Shape::deserialize(&mut r).unwrap(), Shape::Struct { name: "b".into(), sides: vec![5] });
+    }
+
+    crate::model! {
+        pub World {
+            Thing { name: String, tags: crate::Map<String, u8> }
+            Other { n: u8 }
+        }
+    }
+
+    #[test]
+    fn small_chunks_read_the_same_events() {
+        let mut store = crate::Store::<World>::new();
+        for i in 0..50 {
+            let t = store.create(Thing { name: "x".repeat(i), ..Default::default() });
+            // A new name in every event, so that an event read again after
+            // more input defines names again.
+            store.edit(t).tags.insert(format!("tag {i}"), i as u8);
+        }
+        let bytes = store.to_binary().unwrap();
+        fn read(input: Input<'_>, chunk: usize) -> Vec<(Timestamp, WorldEvent)> {
+            let mut events = Vec::new();
+            read_chunked::<World>(input, chunk, false, |at, parsed| {
+                if let Parsed::Event(e) = parsed {
+                    events.push((at, e));
+                }
+                Ok(())
+            })
+            .unwrap();
+            events
+        }
+        let whole = read(Input::Bytes(&bytes), CHUNK);
+        assert_eq!(whole.len(), store.events().len());
+        for chunk in [1, 2, 3, 7, 64] {
+            let mut stream = &bytes[..];
+            assert_eq!(read(Input::Stream(&mut stream), chunk), whole, "chunks of {chunk}");
+        }
     }
 
     #[test]

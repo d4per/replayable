@@ -6,6 +6,7 @@ mod codec;
 mod diff;
 mod error;
 mod field;
+mod file;
 mod id;
 mod list;
 mod macros;
@@ -15,6 +16,7 @@ mod time;
 
 pub use error::Error;
 pub use field::{Declared, Element, Field, Key, OpOf, Stored, Value, Weak};
+pub use file::LogFile;
 pub use id::Id;
 pub use list::{List, ListOp, Splice};
 pub use map::{Map, MapOp};

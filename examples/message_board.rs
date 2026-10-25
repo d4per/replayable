@@ -85,7 +85,7 @@ impl Db {
     fn open(path: &Path, binary: bool) -> Result<Db, Box<dyn std::error::Error>> {
         let store = if path.exists() { load(path, binary)? } else { Store::new() };
         let file = BufWriter::new(OpenOptions::new().create(true).append(true).open(path)?);
-        let saved = store.events().len();
+        let saved = store.event_count();
         let mut db = Db { store, file, binary, saved };
 
         // Files from before pins existed: pin the roots, or `collect` would
@@ -111,7 +111,7 @@ impl Db {
             self.store.write_json_since(self.saved, &mut self.file).expect("writing the log");
         }
         self.file.flush().expect("writing the log");
-        self.saved = self.store.events().len();
+        self.saved = self.store.event_count();
     }
 
     fn create_user(&mut self, name: String) -> Id<User> {

@@ -17,7 +17,7 @@ pub enum Error {
     /// [`Store::write_binary`](crate::Store::write_binary), couldn't be read.
     Binary {
         /// The byte offset of the event that couldn't be read.
-        offset: usize,
+        offset: u64,
         /// What was wrong.
         reason: String,
     },

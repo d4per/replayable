@@ -544,6 +544,8 @@ macro_rules! model {
                 tag: &str,
                 map: &mut A,
             ) -> ::core::result::Result<$crate::__private::Parsed<Self::Event>, A::Error> {
+                // `IgnoredAny` is only used for removed entity types.
+                #[allow(unused_imports)]
                 use $crate::__private::{Parsed, serde::de::IgnoredAny};
                 match tag {
                     $(

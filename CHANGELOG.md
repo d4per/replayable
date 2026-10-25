@@ -48,3 +48,17 @@ First release.
   work the same way, and appending doesn't repeat names already in the
   file. Errors in it are `Error::Binary`. `Timestamp` is written as a
   number in non-human-readable serde formats.
+- Keeping only the state in memory: `Store::resume_binary` and
+  `resume_json` replay a log without keeping its events, and
+  `Store::flush_binary`, `flush_json` and `flush_with` write the events that
+  aren't in storage yet and forget them. `Store::forget_events` forgets
+  them without writing, and `Store::event_count` counts all events,
+  forgotten ones included. The `*_since(n)` methods count from the start of
+  the log. The methods that need the whole log panic once events are
+  forgotten, and `verify` returns an error.
+- `LogFile`, a binary log in a file that a store appends to. Opening it cuts
+  off an event that was only half written, as after a power loss, and a
+  failed append cuts the file back to where it was.
+- `Store::read_binary` reads a chunk at a time instead of reading the whole
+  file first. `Error::Binary::offset` is a `u64`. The binary format is
+  unchanged.

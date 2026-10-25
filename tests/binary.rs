@@ -201,7 +201,7 @@ fn a_cut_off_log_is_an_error_or_a_shorter_log() {
                 whole_events += 1;
             }
             Err(Error::Binary { offset, reason }) => {
-                assert!(offset < end);
+                assert!(offset < end as u64);
                 if end > 5 {
                     assert!(reason.contains("cut off"), "{reason}");
                 }

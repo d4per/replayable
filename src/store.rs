@@ -111,10 +111,18 @@ pub trait Contains<E: Entity>: Model {
 /// Where the times of live events come from.
 type Clock = Arc<dyn Fn() -> Timestamp + Send + Sync>;
 
-/// The events, each with the time it was logged.
+/// The events, each with the time it was logged. Only those after the first
+/// `base` are held in memory.
 struct Log<M: Model> {
     events: Vec<M::Event>,
     times: Vec<Timestamp>,
+    /// How many events were forgotten, from the start of the log.
+    base: usize,
+    /// How many events are in storage: read from it, or flushed to it.
+    /// Never less than `base`.
+    saved: usize,
+    /// The time of the last event, forgotten or not.
+    last: Option<Timestamp>,
     clock: Clock,
 }
 
@@ -124,7 +132,32 @@ impl<M: Model> Log<M> {
     /// system clock is set back.
     fn now(&self) -> Timestamp {
         let now = (self.clock)();
-        self.times.last().map_or(now, |&last| now.max(last))
+        self.last.map_or(now, |last| now.max(last))
+    }
+
+    /// The number of events since the start of the log.
+    fn len(&self) -> usize {
+        self.base + self.events.len()
+    }
+
+    /// Where event `n` of the log is in memory. Panics if it was forgotten.
+    #[track_caller]
+    fn index(&self, n: usize) -> usize {
+        assert!(
+            n >= self.base,
+            "the first {} events were forgotten, so event {n} isn't in memory; read the log from storage instead",
+            self.base
+        );
+        n - self.base
+    }
+
+    /// Forgets the events before `n`.
+    fn forget_before(&mut self, n: usize) {
+        let i = self.index(n);
+        self.events.drain(..i);
+        self.times.drain(..i);
+        self.base = n;
+        self.saved = self.saved.max(n);
     }
 
     /// Adds a live event, after checking that it can be stored. In debug
@@ -142,6 +175,15 @@ impl<M: Model> Log<M> {
     fn push(&mut self, at: Timestamp, event: M::Event) {
         self.events.push(event);
         self.times.push(at);
+        self.last = Some(at);
+    }
+
+    /// Counts an event that's in storage, without keeping it.
+    fn pass(&mut self, at: Timestamp) {
+        debug_assert!(self.events.is_empty());
+        self.base += 1;
+        self.saved = self.base;
+        self.last = Some(at);
     }
 }
 
@@ -218,7 +260,14 @@ impl<M: Model> Default for Store<M> {
 impl<M: Model> Store<M> {
     /// An empty store.
     pub fn new() -> Self {
-        let log = Log { events: Vec::new(), times: Vec::new(), clock: Arc::new(Timestamp::now) };
+        let log = Log {
+            events: Vec::new(),
+            times: Vec::new(),
+            base: 0,
+            saved: 0,
+            last: None,
+            clock: Arc::new(Timestamp::now),
+        };
         Store { state: M::default(), log, next_id: 1, editing: None, binary: Mutex::default() }
     }
 
@@ -433,9 +482,30 @@ impl<M: Model> Store<M> {
         self.state.table().iter().map(|(id, e)| (*id, e))
     }
 
-    /// The whole log, oldest event first.
+    /// The events in memory, oldest first: the whole log, unless some were
+    /// forgotten (see [`forget_events`](Store::forget_events)).
     pub fn events(&self) -> &[M::Event] {
         &self.log.events
+    }
+
+    /// The number of events logged since the start of the log, forgotten
+    /// ones included. Use it to remember how much of the log is in a file.
+    pub fn event_count(&self) -> usize {
+        self.log.len()
+    }
+
+    /// Forgets the events held in memory, to keep memory use bounded when
+    /// you write them somewhere yourself, for example with
+    /// [`events_since`](Store::events_since). The state and
+    /// [`event_count`](Store::event_count) stay the same.
+    ///
+    /// Afterwards, the methods that need the whole log, like
+    /// [`as_of`](Store::as_of), [`to_json`](Store::to_json) and
+    /// [`to_binary`](Store::to_binary), panic, and [`verify`](Store::verify)
+    /// returns an error. The [`flush_*`](Store::flush_binary) methods write
+    /// and forget in one go.
+    pub fn forget_events(&mut self) {
+        self.log.forget_before(self.log.len());
     }
 
     /// The time of every event in [`events`](Store::events), in the same
@@ -454,12 +524,14 @@ impl<M: Model> Store<M> {
         &self.log.times
     }
 
-    /// The events after the first `n`. Save `events().len()` after writing
-    /// the log, and pass it here next time to get only the new events.
+    /// The events after the first `n`. Save [`event_count`](Store::event_count)
+    /// after writing the log, and pass it here next time to get only the new
+    /// events.
     ///
-    /// Panics if `n` is larger than the number of events.
+    /// Panics if `n` is larger than the number of events, or if some of the
+    /// events after the first `n` were forgotten.
     pub fn events_since(&self, n: usize) -> &[M::Event] {
-        &self.log.events[n..]
+        &self.log.events[self.log.index(n)..]
     }
 
     /// The store as it was after the first `n` events, history included.
@@ -470,8 +542,12 @@ impl<M: Model> Store<M> {
     ///
     /// The events keep their times, and the new store has the same clock.
     ///
-    /// Panics if `n` is larger than the number of events.
+    /// Panics if `n` is larger than the number of events, or if events were
+    /// forgotten (see [`forget_events`](Store::forget_events)).
     pub fn as_of(&self, n: usize) -> Self {
+        if n > 0 {
+            self.log.index(0);
+        }
         let mut store = Self::new();
         store.log.clock = self.log.clock.clone();
         for (&at, event) in self.log.times[..n].iter().zip(&self.log.events) {
@@ -500,6 +576,7 @@ impl<M: Model> Store<M> {
     /// assert!(!store.as_of_time(t).contains(note));
     /// ```
     pub fn as_of_time(&self, t: Timestamp) -> Self {
+        self.log.index(0);
         self.as_of(self.log.times.partition_point(|&at| at <= t))
     }
 
@@ -520,16 +597,22 @@ impl<M: Model> Store<M> {
     /// Fails without changing anything if the event doesn't fit the current
     /// state, or if `at` is earlier than the time of the last event.
     pub fn apply_event_at(&mut self, at: Timestamp, event: M::Event) -> Result<(), Error> {
-        let index = self.log.events.len();
-        if let Some(&last) = self.log.times.last() {
+        self.apply_to_state(at, &event)?;
+        self.log.push(at, event);
+        Ok(())
+    }
+
+    /// The part of `apply_event_at` that changes the state, without logging.
+    fn apply_to_state(&mut self, at: Timestamp, event: &M::Event) -> Result<(), Error> {
+        let index = self.log.len();
+        if let Some(last) = self.log.last {
             if at < last {
                 let reason = format!("its time {at} is before {last}, the time of the event before it");
                 return Err(Error::InvalidEvent { index, reason });
             }
         }
-        self.state.apply(&event).map_err(|reason| Error::InvalidEvent { index, reason })?;
-        self.next_id = self.next_id.max(M::entity_id(&event).saturating_add(1));
-        self.log.push(at, event);
+        self.state.apply(event).map_err(|reason| Error::InvalidEvent { index, reason })?;
+        self.next_id = self.next_id.max(M::entity_id(event).saturating_add(1));
         Ok(())
     }
 
@@ -560,20 +643,72 @@ impl<M: Model> Store<M> {
     /// first `n`. Use it to append to a file that already holds the first
     /// `n` events.
     ///
-    /// Panics if `n` is larger than the number of events.
+    /// Panics if `n` is larger than the number of events, or if some of the
+    /// events after the first `n` were forgotten.
     pub fn write_json_since(&self, n: usize, mut writer: impl Write) -> std::io::Result<()> {
-        for (&at, event) in self.log.times[n..].iter().zip(&self.log.events[n..]) {
+        let i = self.log.index(n);
+        for (&at, event) in self.log.times[i..].iter().zip(&self.log.events[i..]) {
             codec::write_line::<M>(&mut writer, at, event)?;
             writer.write_all(b"\n")?;
         }
         Ok(())
     }
 
+    /// Appends the events that aren't in storage yet to a JSON Lines log,
+    /// then forgets them, so that the log doesn't have to stay in memory.
+    /// See [`flush_binary`](Store::flush_binary), which works the same way.
+    pub fn flush_json(&mut self, writer: impl Write) -> std::io::Result<()> {
+        self.write_json_since(self.log.saved, writer)?;
+        self.log.forget_before(self.log.len());
+        Ok(())
+    }
+
+    /// Hands every event that isn't in storage yet to `f`, with its time,
+    /// and forgets the events it accepts. If `f` fails, the events from that
+    /// one on are kept, and the error is returned.
+    ///
+    /// For storing events your own way. The events are in storage after
+    /// they were read with one of the `read_*`, `from_*` and `resume_*`
+    /// methods, or flushed.
+    ///
+    /// ```
+    /// # use replayable::{model, Store};
+    /// # model! { pub World { User { name: String } } }
+    /// let mut store = Store::<World>::new();
+    /// store.create(User { name: "a".into() });
+    /// let mut sent = Vec::new();
+    /// store.flush_with(|at, event| {
+    ///     sent.push(format!("{at} {event}"));
+    ///     Ok::<(), std::convert::Infallible>(())
+    /// })?;
+    /// assert!(store.events().is_empty());
+    /// assert_eq!(sent.len(), 1);
+    /// # Ok::<(), std::convert::Infallible>(())
+    /// ```
+    pub fn flush_with<E>(&mut self, mut f: impl FnMut(Timestamp, &M::Event) -> Result<(), E>) -> Result<(), E> {
+        let start = self.log.index(self.log.saved);
+        let mut done = start;
+        let result = loop {
+            let (Some(&at), Some(event)) = (self.log.times.get(done), self.log.events.get(done)) else {
+                break Ok(());
+            };
+            if let Err(e) = f(at, event) {
+                break Err(e);
+            }
+            done += 1;
+        };
+        self.log.forget_before(self.log.base + done);
+        result
+    }
+
     /// The log as a JSON Lines string. See [`write_json`](Store::write_json).
     ///
     /// Fails only if a value can't be written as JSON, like a map with
     /// non-string keys inside one of your own value types.
+    ///
+    /// Panics if events were forgotten (see [`forget_events`](Store::forget_events)).
     pub fn to_json(&self) -> Result<String, serde_json::Error> {
+        self.log.index(0);
         let mut out = Vec::new();
         for (&at, event) in self.log.times.iter().zip(&self.log.events) {
             codec::write_line::<M>(&mut out, at, event)?;
@@ -591,15 +726,42 @@ impl<M: Model> Store<M> {
     /// entity types declared with `#![removed(..)]` are skipped (they aren't
     /// kept in [`events`](Store::events)). Any other name the model doesn't
     /// know is an [`Error::Json`].
-    pub fn read_json(mut reader: impl BufRead) -> Result<Self, Error> {
+    pub fn read_json(reader: impl BufRead) -> Result<Self, Error> {
+        Self::load_json(reader, true)
+    }
+
+    /// Like [`read_json`](Store::read_json), but the events aren't kept in
+    /// memory as they are read, only the state they build up. The store is
+    /// ready to append to the log: [`flush_json`](Store::flush_json) writes
+    /// the events logged after this.
+    ///
+    /// ```no_run
+    /// # use replayable::{model, Store};
+    /// # model! { pub World { User { name: String } } }
+    /// use std::fs::{File, OpenOptions};
+    /// use std::io::{BufReader, BufWriter, Write};
+    ///
+    /// let mut store = Store::<World>::resume_json(BufReader::new(File::open("log.jsonl")?))?;
+    /// let mut file = BufWriter::new(OpenOptions::new().append(true).open("log.jsonl")?);
+    /// store.create(User { name: "a".into() });
+    /// store.flush_json(&mut file)?;
+    /// file.flush()?;
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn resume_json(reader: impl BufRead) -> Result<Self, Error> {
+        Self::load_json(reader, false)
+    }
+
+    fn load_json(mut reader: impl BufRead, keep: bool) -> Result<Self, Error> {
         let mut store = Self::new();
         let mut line = String::new();
         let mut number = 0;
         while reader.read_line(&mut line)? > 0 {
             number += 1;
-            store.apply_json_line(number, &line)?;
+            store.apply_json_line(number, &line, keep)?;
             line.clear();
         }
+        store.log.saved = store.log.len();
         Ok(store)
     }
 
@@ -607,12 +769,13 @@ impl<M: Model> Store<M> {
     pub fn from_json(json: &str) -> Result<Self, Error> {
         let mut store = Self::new();
         for (i, line) in json.lines().enumerate() {
-            store.apply_json_line(i + 1, line)?;
+            store.apply_json_line(i + 1, line, true)?;
         }
+        store.log.saved = store.log.len();
         Ok(store)
     }
 
-    fn apply_json_line(&mut self, number: usize, line: &str) -> Result<(), Error> {
+    fn apply_json_line(&mut self, number: usize, line: &str, keep: bool) -> Result<(), Error> {
         if line.trim().is_empty() {
             return Ok(());
         }
@@ -620,12 +783,21 @@ impl<M: Model> Store<M> {
         let mut de = serde_json::Deserializer::from_str(line);
         let (at, parsed) = codec::parse_line::<M, _>(&mut de).map_err(json_error)?;
         de.end().map_err(json_error)?;
-        self.apply_parsed(at, parsed)
+        self.apply_parsed(at, parsed, keep)
     }
 
-    fn apply_parsed(&mut self, at: Timestamp, parsed: Parsed<M::Event>) -> Result<(), Error> {
+    /// Applies an event read from storage, keeping it in memory or not.
+    fn apply_parsed(&mut self, at: Timestamp, parsed: Parsed<M::Event>, keep: bool) -> Result<(), Error> {
         match parsed {
-            Parsed::Event(event) => self.apply_event_at(at, event),
+            Parsed::Event(event) => {
+                self.apply_to_state(at, &event)?;
+                if keep {
+                    self.log.push(at, event);
+                } else {
+                    self.log.pass(at);
+                }
+                Ok(())
+            }
             Parsed::Skipped { id } => {
                 self.next_id = self.next_id.max(id.saturating_add(1));
                 Ok(())
@@ -672,19 +844,63 @@ impl<M: Model> Store<M> {
     /// # Ok::<(), Box<dyn std::error::Error>>(())
     /// ```
     ///
-    /// Panics if `n` is larger than the number of events.
+    /// Panics if `n` is larger than the number of events, or if some of the
+    /// events after the first `n` were forgotten.
     pub fn write_binary_since(&self, n: usize, writer: impl Write) -> std::io::Result<()> {
+        let i = self.log.index(n);
         let mut state = self.binary.lock().unwrap_or_else(PoisonError::into_inner);
-        binary::write::<M>(&mut state, n, &self.log.times, &self.log.events, writer)
+        binary::write::<M>(&mut state, n, n == 0, &self.log.times[i..], &self.log.events[i..], writer)
+    }
+
+    /// Appends the events that aren't in storage yet to a binary log, then
+    /// forgets them, so that the log doesn't have to stay in memory.
+    ///
+    /// The events are in storage once they were read with one of the
+    /// `read_*`, `from_*` and `resume_*` methods, or flushed. So this writes
+    /// the events logged since the store was read or last flushed, to the
+    /// same log. A new store starts a new log, with the header.
+    ///
+    /// The events are only forgotten if writing succeeds. If it fails, the
+    /// writer may hold part of an event, which must be removed before trying
+    /// again; [`LogFile`](crate::LogFile) does that for files.
+    ///
+    /// ```
+    /// # use replayable::{model, Store};
+    /// # model! { pub World { User { name: String } } }
+    /// let mut store = Store::<World>::new();
+    /// let mut file = Vec::new(); // a File, or any other `io::Write`
+    /// let u = store.create(User { name: "a".into() });
+    /// store.flush_binary(&mut file)?;
+    /// assert!(store.events().is_empty());
+    ///
+    /// store.edit(u).name = "b".into();
+    /// store.flush_binary(&mut file)?;
+    ///
+    /// let loaded = Store::<World>::resume_binary(&file[..])?;
+    /// assert_eq!(loaded[u].name, "b");
+    /// assert_eq!(loaded.event_count(), 2);
+    /// # Ok::<(), Box<dyn std::error::Error>>(())
+    /// ```
+    pub fn flush_binary(&mut self, writer: impl Write) -> std::io::Result<()> {
+        let n = self.log.saved;
+        let i = self.log.index(n);
+        let state = self.binary.get_mut().unwrap_or_else(PoisonError::into_inner);
+        let header = !state.has_header;
+        binary::write::<M>(state, n, header, &self.log.times[i..], &self.log.events[i..], writer)?;
+        self.log.forget_before(self.log.len());
+        Ok(())
     }
 
     /// The log in the binary format. See [`write_binary`](Store::write_binary).
     ///
-    /// Fails only if one of your own value types fails to serialize.
+    /// Fails only if one of your own value types fails to serialize. Panics if
+    /// events were forgotten (see [`forget_events`](Store::forget_events)).
     pub fn to_binary(&self) -> std::io::Result<Vec<u8>> {
+        self.log.index(0);
         let mut out = Vec::new();
         // Not the store's own state, which is about the file it writes to.
-        binary::write::<M>(&mut binary::WriteState::default(), 0, &self.log.times, &self.log.events, &mut out)?;
+        let state = &mut binary::WriteState::default();
+        binary::write::<M>(state, 0, true, &self.log.times, &self.log.events, &mut out)?;
         Ok(out)
     }
 
@@ -692,20 +908,46 @@ impl<M: Model> Store<M> {
     /// An empty file is an empty log. Older versions of the model are handled
     /// as in [`read_json`](Store::read_json).
     ///
-    /// The whole file is read into memory first.
+    /// The log is read a chunk at a time, so the reader doesn't need to be
+    /// buffered. The events are kept in memory; see
+    /// [`resume_binary`](Store::resume_binary) to only keep the state.
     pub fn read_binary(mut reader: impl Read) -> Result<Self, Error> {
-        let mut bytes = Vec::new();
-        reader.read_to_end(&mut bytes)?;
-        Self::from_binary(&bytes)
+        Ok(Self::load_binary(binary::Input::Stream(&mut reader), true, false)?.0)
+    }
+
+    /// Like [`read_binary`](Store::read_binary), but the events aren't kept in
+    /// memory as they are read, only the state they build up. Memory use
+    /// depends on the size of the state, not of the log. The store is ready
+    /// to append to the log: [`flush_binary`](Store::flush_binary) writes
+    /// the events logged after this.
+    ///
+    /// For a log in a file, [`LogFile`](crate::LogFile) does this and the
+    /// appending for you.
+    pub fn resume_binary(mut reader: impl Read) -> Result<Self, Error> {
+        Ok(Self::load_binary(binary::Input::Stream(&mut reader), false, false)?.0)
     }
 
     /// Like [`read_binary`](Store::read_binary), from bytes in memory.
     pub fn from_binary(bytes: &[u8]) -> Result<Self, Error> {
+        Ok(Self::load_binary(binary::Input::Bytes(bytes), true, false)?.0)
+    }
+
+    /// Replays a binary log, keeping its events in memory or not. With
+    /// `allow_cut_off`, a log that ends in the middle of an event isn't an
+    /// error. Also returns how reading ended.
+    pub(crate) fn load_binary(
+        input: binary::Input<'_>,
+        keep: bool,
+        allow_cut_off: bool,
+    ) -> Result<(Self, binary::ReadEnd), Error> {
         let mut store = Self::new();
-        let state = binary::read::<M>(bytes, |at, parsed| store.apply_parsed(at, parsed))?;
-        let state = binary::appending(state, bytes, store.log.events.len());
-        *store.binary.get_mut().unwrap_or_else(PoisonError::into_inner) = state;
-        Ok(store)
+        let mut end = binary::read::<M>(input, allow_cut_off, |at, parsed| store.apply_parsed(at, parsed, keep))?;
+        store.log.saved = store.log.len();
+        if end.complete > 0 {
+            end.state.upto = Some(store.log.len());
+        }
+        *store.binary.get_mut().unwrap_or_else(PoisonError::into_inner) = std::mem::take(&mut end.state);
+        Ok((store, end))
     }
 
     /// Checks that the log really gives the current state: writes it as
@@ -716,6 +958,12 @@ impl<M: Model> Store<M> {
     /// logged, for example through a `Cell` inside a value, or that a value
     /// type doesn't survive a trip through JSON.
     pub fn verify(&self) -> Result<(), String> {
+        if self.log.base > 0 {
+            return Err(format!(
+                "the first {} events were forgotten, so the log can't be replayed from memory; replay it from storage",
+                self.log.base
+            ));
+        }
         let json = self.to_json().map_err(|e| format!("the log can't be written as JSON: {e}"))?;
         let from_json = Self::from_json(&json).map_err(|e| format!("the log can't be read back from JSON: {e}"))?;
         let bytes = self.to_binary().map_err(|e| format!("the log can't be written in the binary format: {e}"))?;
@@ -749,7 +997,7 @@ impl<M: Contains<E>, E: Entity> Index<Id<E>> for Store<M> {
 
 impl<M: Model> fmt::Debug for Store<M> {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("Store").field("events", &self.log.events.len()).field("next_id", &self.next_id).finish()
+        f.debug_struct("Store").field("events", &self.log.len()).field("next_id", &self.next_id).finish()
     }
 }
 
